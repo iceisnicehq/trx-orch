@@ -1,0 +1,6 @@
+ALTER TABLE "EngineState" ADD COLUMN "mixAmountMode" TEXT NOT NULL DEFAULT 'RANDOM';
+ALTER TABLE "EngineState" ADD COLUMN "mixAmountList" TEXT NOT NULL DEFAULT '[1000000,500000]';
+ALTER TABLE "EngineState" ADD COLUMN "mixAmountCursor" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "EngineState" ADD COLUMN "mixLastReceiver" TEXT;
+ALTER TABLE "EngineState" ADD COLUMN "rebalanceFromSequence" INTEGER;
+ALTER TABLE "EngineState" ADD COLUMN "settlementFromSequence" INTEGER;

@@ -1,0 +1,94 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "sqlite"
+  url = env("DATABASE_URL")
+}
+
+model Wallet {
+  address            String @id
+  ordinal            Int @unique
+  autoApprove        Boolean @default(false)
+  mixEnabled         Boolean @default(false)
+  joined             Boolean @default(false)
+  entryBalanceSun    Int?
+  balanceSnapshotSun Int @default(1000000)
+  transfersOut       Transfer[] @relation("out")
+}
+
+model Transfer {
+  id         String @id @default(cuid())
+  sequence   Int @unique
+  kind       String // MIX, REBALANCE, PAYOUT
+  status     String // PLANNED, APPROVED, SUBMITTING, SUBMITTED, CONFIRMED, CANCELLED, PAUSED, UNKNOWN
+  from       String
+  to         String
+  amountSun  Int
+  scheduledAt DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  txId       String? @unique
+  signedJson String? // same signed transaction for audit and crash recovery; never expose to clients
+  note       String?
+  bandwidthUsed Int? // actual Bandwidth reported in the confirmed on-chain receipt
+  confirmedAt DateTime? // block timestamp, not the later time receipt polling completed
+  sender     Wallet @relation("out",fields:[from],references:[address])
+  @@index([status,sequence])
+}
+
+model EngineState {
+  id              Int @id @default(1)
+  phase           String @default("IDLE") // IDLE, MIXING, REBALANCE_REQUESTED, REBALANCING, END_REQUESTED, SETTLING, COMPLETE, HALTED
+  status          String @default("Ready. Select at least two funded wallets, then Start.")
+  teacherAddress  String
+  teacherBaseline Int
+  nextSequence    Int @default(1)
+  lastPlanAt      DateTime?
+  mixAmountMode   String @default("RANDOM") // RANDOM or LIST
+  mixAmountList   String @default("[1000000,500000]") // exact Sun amounts, JSON
+  mixAmountCursor Int @default(0) // advances only after a confirmed LIST transfer
+  mixLastReceiver String? // next preferred sender for the LIST chain
+  rebalanceFromSequence Int? // first sequence in this rebalance batch
+  settlementFromSequence Int? // first sequence in this end-game batch
+  fatalReason     String?
+  updatedAt       DateTime @updatedAt
+}
+
+model Audit {
+  id        Int @id @default(autoincrement())
+  at        DateTime @default(now())
+  event     String
+  detail    String
+  transferId String?
+  @@index([at])
+}
+
+// One cursor per Telegram channel. Its audit position is committed together
+// with deliveries, so an API restart cannot silently skip an audit event.
+model TelegramCursor {
+  channelId          String @id
+  pinnedMessageId    Int
+  lastAuditId        Int @default(0)
+  lastQueueHash      String?
+  nextQueueAttemptAt DateTime?
+  queueLastError     String?
+  createdAt          DateTime @default(now())
+}
+
+model TelegramDelivery {
+  id            String @id @default(cuid())
+  channelId     String
+  auditId       Int
+  text          String
+  status        String @default("PENDING") // PENDING, SENT
+  priority      Int @default(0) // FATAL alerts go out before routine audit backlog
+  attempts      Int @default(0)
+  nextAttemptAt DateTime @default(now())
+  lastError     String?
+  messageId     Int?
+  sentAt        DateTime?
+  createdAt     DateTime @default(now())
+  @@unique([channelId,auditId])
+  @@index([channelId,status,nextAttemptAt])
+}

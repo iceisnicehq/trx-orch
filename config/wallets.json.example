@@ -1,0 +1,90 @@
+{
+  "teacherAddress": "TM7bhaudKiaUja2iZeeNprqwHBrWzyS7oc",
+  "wallets": [
+    {
+      "slot": 1,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 2,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 3,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 4,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 5,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 6,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 7,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 8,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 9,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 10,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 11,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 12,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 13,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 14,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 15,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 16,
+      "address": "",
+      "privateKey": ""
+    },
+    {
+      "slot": 17,
+      "address": "",
+      "privateKey": ""
+    }
+  ]
+}
