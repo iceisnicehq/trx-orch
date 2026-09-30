@@ -1,5 +1,5 @@
 import {randomInt} from 'node:crypto';
-import type {PrismaClient,Transfer,Wallet} from '@prisma/client';
+import type {EngineState,PrismaClient,Transfer,Wallet} from '@prisma/client';
 import {MODE,TARGET,type Config} from './config.js';
 import {settleTargets,settlementPlan} from './settlement.js';
 import {BandwidthWait,TronService} from './tron.js';
@@ -12,6 +12,10 @@ const PLAN_WINDOW_MS=24*60*60_000;
 const PLAN_RETRY_MS=30*60_000;
 const OPEN_MIX=['PLANNED','APPROVED','PAUSED','SUBMITTING','SUBMITTED','UNKNOWN'];
 const VALID_LIST_AMOUNTS=new Set([500_000,1_000_000]);
+type PoolBalance={address:string;sun:number};
+type ExtraReserve={address:string;sun:number};
+type PoolReview={ok:true;balances:PoolBalance[];extras:ExtraReserve[];total:number;expected:number}|{ok:false;reason:string};
+const RESUMABLE_PHASES=['MIXING','REBALANCE_REQUESTED','REBALANCING','END_REQUESTED','SETTLING'];
 function amountList(json:string):number[]{
   const parsed:unknown=JSON.parse(json);
   if(!Array.isArray(parsed)||parsed.length<1||parsed.length>64||!parsed.every(x=>typeof x==='number'&&VALID_LIST_AMOUNTS.has(x)))throw Error('Invalid persisted mix amount list');
@@ -63,7 +67,9 @@ export class EngineService {
   private async set(phase:string,status:string){await this.db.engineState.update({where:{id:1},data:{phase,status}});}
   private async fatal(reason:string){
     this.tron.invalidatePublicSnapshot();
-    await this.db.engineState.update({where:{id:1},data:{phase:'HALTED',status:`FATAL: ${reason}`,fatalReason:reason}});
+    const old=await this.state();
+    await this.db.engineState.update({where:{id:1},data:{phase:'HALTED',status:`FATAL: ${reason}`,fatalReason:reason,
+      ...(old.phase!=='HALTED'?{haltedFromPhase:old.phase}:{})}});
     await this.audit('FATAL',reason);
     console.error('FATAL:',reason);
   }
@@ -89,32 +95,107 @@ export class EngineService {
       if(extra.length)await tx.engineState.update({where:{id:1},data:{lastPlanAt:null}});
     });
   }
-  private async reconcile(){
+  private async inspectPool():Promise<PoolReview>{
     const s=await this.state();
     const joined=await this.joined();
-    if(!joined.length||joined.some(w=>w.entryBalanceSun===null)){await this.fatal('Pool has no valid joined-wallet baseline');return null;}
+    if(!joined.length||joined.some(w=>w.entryBalanceSun===null||w.entryBalanceSun<TARGET))return {ok:false,reason:'Pool has no valid joined-wallet baseline'};
     const b=await this.balances(joined), total=b.reduce((n,w)=>n+w.sun,0);
+    if(b.some(w=>!Number.isSafeInteger(w.sun)||w.sun<0))return {ok:false,reason:'A joined wallet has an invalid balance'};
     const paid=await this.db.transfer.aggregate({where:{kind:'PAYOUT',status:'CONFIRMED'},_sum:{amountSun:true}});
     const pending=await this.db.transfer.aggregate({where:{kind:'PAYOUT',status:{in:['SUBMITTING','SUBMITTED']}},_sum:{amountSun:true}});
     const expected=joined.reduce((n,w)=>n+w.entryBalanceSun!,0)-(paid._sum.amountSun??0);
     const pendingSun=pending._sum.amountSun??0;
-    if(total<expected-pendingSun||total>expected){await this.fatal(`Pool invariant violated: ${total} Sun, expected ${expected}${pendingSun?` (up to ${pendingSun} in flight)`:''}`);return null;}
+    if(total<expected-pendingSun||(pendingSun>0&&total>expected))
+      return {ok:false,reason:`Pool invariant violated: ${total} Sun, expected ${expected}${pendingSun?` (up to ${pendingSun} in flight)`:''}`};
     const teacher=await this.tron.teacherBalance();
     const baseline=s.teacherBaseline+(paid._sum.amountSun??0);
-    if(teacher<baseline||teacher>baseline+pendingSun){await this.fatal('Teacher balance differs from attributed payouts');return null;}
+    if(teacher<baseline||teacher>baseline+pendingSun)return {ok:false,reason:'Teacher balance differs from attributed payouts'};
     if(pendingSun===0){
       const expectedByWallet=new Map(joined.map(w=>[w.address,w.entryBalanceSun!]));
       const confirmed=await this.db.transfer.findMany({where:{status:'CONFIRMED'},select:{from:true,to:true,amountSun:true}});
       for(const t of confirmed){
-        if(!expectedByWallet.has(t.from)){await this.fatal(`Confirmed transfer from a wallet outside the active pool: ${t.from}`);return null;}
+        if(!expectedByWallet.has(t.from))return {ok:false,reason:`Confirmed transfer from a wallet outside the active pool: ${t.from}`};
         expectedByWallet.set(t.from,expectedByWallet.get(t.from)!-t.amountSun);
         if(expectedByWallet.has(t.to))expectedByWallet.set(t.to,expectedByWallet.get(t.to)!+t.amountSun);
       }
-      const discrepancy=b.find(w=>w.sun!==expectedByWallet.get(w.address));
-      if(discrepancy){await this.fatal(`Wallet ${discrepancy.address} balance differs from audited transfers`);return null;}
+      const missing=b.find(w=>w.sun<expectedByWallet.get(w.address)!);
+      if(missing)return {ok:false,reason:`Wallet ${missing.address} balance is below its audited balance`};
+      const extras=b.map(w=>({address:w.address,sun:w.sun-expectedByWallet.get(w.address)!})).filter(w=>w.sun>0);
+      if(extras.reduce((n,w)=>n+w.sun,0)!==total-expected)
+        return {ok:false,reason:'Joined pool and confirmed transfer ledger disagree'};
+      if(extras.some(w=>joined.find(j=>j.address===w.address)!.entryBalanceSun!+w.sun>2_147_483_647))
+        return {ok:false,reason:'Protected extra reserve exceeds the database balance range'};
+      return {ok:true,balances:b,extras,total,expected};
     }
-    return b;
+    return {ok:true,balances:b,extras:[],total,expected};
   }
+  private async confirmExtraSnapshot(review:Extract<PoolReview,{ok:true}>){
+    if(!review.extras.length)return;
+    const fresh=await this.balances(await this.joined());
+    if(fresh.length!==review.balances.length||fresh.some((w,i)=>w.address!==review.balances[i].address||w.sun!==review.balances[i].sun))
+      throw new HttpError(409,'Wallet balances changed while confirming extra Sun; retry shortly');
+  }
+  private async saveExtraReserves(extras:ExtraReserve[],resumePhase?:string){
+    const sum=extras.reduce((n,w)=>n+w.sun,0);
+    await this.db.$transaction(async tx=>{
+      for(const w of extras){
+        await tx.wallet.update({where:{address:w.address},data:{entryBalanceSun:{increment:w.sun}}});
+        await tx.audit.create({data:{event:'EXTRA_RESERVE',detail:`${w.address}: ${w.sun} newly observed Sun protected as this wallet's personal reserve; game stake unchanged`}});
+      }
+      await tx.engineState.update({where:{id:1},data:{status:resumePhase?
+        `Verified ${sum} extra Sun as protected reserves; resuming ${resumePhase}`:
+        `Verified ${sum} new Sun as protected wallet reserves; game stake unchanged`,
+        ...(resumePhase?{phase:resumePhase,fatalReason:null,haltedFromPhase:null}:{}),lastPlanAt:null}});
+      if(resumePhase)await tx.audit.create({data:{event:'RESUMED',detail:`Guarded recovery to ${resumePhase}; ${sum} extra Sun protected; no transfers or approvals discarded`}});
+    },{timeout:30_000});
+    this.tron.invalidatePublicSnapshot();
+  }
+  private async reconcile(){
+    const review=await this.inspectPool();
+    if(!review.ok){await this.fatal(review.reason);return null;}
+    if(review.extras.length){
+      await this.confirmExtraSnapshot(review);
+      await this.saveExtraReserves(review.extras);
+    }
+    return review.balances;
+  }
+  private async extraRecoveryPhase(s:EngineState):Promise<string|null>{
+    if(s.phase!=='HALTED'||!s.fatalReason)return null;
+    const numbers=/^Pool invariant violated: (\d+) Sun, expected (\d+)$/.exec(s.fatalReason);
+    if(!numbers||Number(numbers[1])<=Number(numbers[2]))return null;
+    if(s.haltedFromPhase)return RESUMABLE_PHASES.includes(s.haltedFromPhase)?s.haltedFromPhase:null;
+    // Older releases did not persist the previous phase. Infer MIXING only
+    // when there is no settlement marker, open settlement row, or paid wallet.
+    if(s.rebalanceFromSequence!==null||s.settlementFromSequence!==null)return null;
+    const [map,payout]=await Promise.all([
+      this.db.transfer.findFirst({where:{kind:{in:['REBALANCE','PAYOUT']},status:{in:['PLANNED','APPROVED','PAUSED','SUBMITTING','SUBMITTED','UNKNOWN']}}}),
+      this.db.transfer.count({where:{kind:'PAYOUT',status:'CONFIRMED'}})
+    ]);
+    return map||payout?null:'MIXING';
+  }
+  private async recoveryReview(){
+    const s=await this.state();
+    if(s.phase!=='HALTED')throw new HttpError(409,'Recovery is available only for a halted game');
+    const phase=await this.extraRecoveryPhase(s);
+    if(!phase)return {eligible:false,reason:'This halt cannot be recovered as extra Sun; investigate the original failure and any in-flight transactions',phase:null,extras:[] as ExtraReserve[],totalExtraSun:0};
+    const inFlight=await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}});
+    if(inFlight)return {eligible:false,reason:'An uncertain or submitted transfer must be resolved before recovery',phase:null,extras:[] as ExtraReserve[],totalExtraSun:0};
+    const review=await this.inspectPool();
+    if(!review.ok)return {eligible:false,reason:review.reason,phase:null,extras:[] as ExtraReserve[],totalExtraSun:0};
+    return {eligible:true,reason:null,phase,extras:review.extras,totalExtraSun:review.extras.reduce((n,w)=>n+w.sun,0),review};
+  }
+  async extraRecoveryPreview(){return this.withLock(async()=>{
+    const {review:_,...preview}=await this.recoveryReview();
+    return preview;
+  });}
+  async resumeExtraReserves(){return this.withLock(async()=>{
+    const recovery=await this.recoveryReview();
+    if(!recovery.eligible||!recovery.review||!recovery.phase)throw new HttpError(409,recovery.reason??'Extra reserve recovery is unavailable');
+    await this.confirmExtraSnapshot(recovery.review);
+    await this.saveExtraReserves(recovery.extras,recovery.phase);
+    await this.tickBody();
+    return {ok:true,phase:recovery.phase,reservedSun:recovery.totalExtraSun};
+  });}
   async start(){return this.withLock(async()=>{
     const s=await this.state();
     if(s.phase!=='IDLE')throw new HttpError(409,`Cannot start in ${s.phase}`);
@@ -354,14 +435,14 @@ export class EngineService {
     const now=new Date();
     const rows=steps.map(x=>({...x,status:'PLANNED',scheduledAt:now}));
     await this.insert(rows,{
-      phase:'SETTLING',status:`Settlement map ready: ${steps.filter(s=>s.kind==='REBALANCE').length} balancing transfers and ${b.length} exact 1 TRX payouts; original extra Sun stays in each wallet`,
+      phase:'SETTLING',status:`Settlement map ready: ${steps.filter(s=>s.kind==='REBALANCE').length} balancing transfers and ${b.length} exact 1 TRX payouts; protected extra Sun stays in each wallet`,
       event:'SETTLEMENT_MAP',detail:`${steps.length} steps for ${b.length} joined wallets; ${balances.reduce((n,w)=>n+w.reserveSun,0)} extra Sun excluded from the game`
     });
   }
   private async createRebalance(b:{address:string;sun:number}[]){
     const steps=await this.rebalanceSteps(b);
     await this.insert(steps.map(x=>({...x,kind:'REBALANCE',status:'PLANNED',scheduledAt:new Date()})),{
-      phase:'REBALANCING',status:`Rebalance map: ${steps.length} transfers to return all joined wallets to exactly 1 TRX plus their original extra Sun`,
+      phase:'REBALANCING',status:`Rebalance map: ${steps.length} transfers to return all joined wallets to exactly 1 TRX plus their protected extra Sun`,
       event:'REBALANCE_MAP',detail:`${steps.length} exact balancing transfers; no teacher payouts; mixing resumes after confirmation`
     });
   }
@@ -532,7 +613,7 @@ export class EngineService {
           await this.db.$transaction(async tx=>{
             await tx.engineState.update({where:{id:1},data:{phase:'MIXING',rebalanceFromSequence:null,
               lastPlanAt:null,mixAmountCursor:0,mixLastReceiver:null,
-              status:`Rebalance complete: ${count} transfers; each joined wallet again has 1 TRX plus its original extra Sun`}});
+              status:`Rebalance complete: ${count} transfers; each joined wallet again has 1 TRX plus its protected extra Sun`}});
             await tx.audit.create({data:{event:'REBALANCE_COMPLETE',detail:`${count} transfers confirmed; each joined wallet restored; mixing resumed`}});
           });
           await this.plan(b);
@@ -540,9 +621,9 @@ export class EngineService {
         }
         if(s.phase==='SETTLING'){
           const joined=await this.joined();
-          if(b.some(w=>w.sun!==joined.find(j=>j.address===w.address)!.entryBalanceSun!-TARGET)){await this.fatal('Settlement queue exhausted without restoring original extra Sun');return;}
+          if(b.some(w=>w.sun!==joined.find(j=>j.address===w.address)!.entryBalanceSun!-TARGET)){await this.fatal('Settlement queue exhausted without restoring protected extra Sun');return;}
           await this.db.$transaction(async tx=>{
-            await tx.engineState.update({where:{id:1},data:{phase:'COMPLETE',status:'Complete: each joined wallet sent exactly 1 TRX; original extra Sun remains in its wallet'}});
+            await tx.engineState.update({where:{id:1},data:{phase:'COMPLETE',status:'Complete: each joined wallet sent exactly 1 TRX; protected extra Sun remains in its wallet'}});
             await tx.audit.create({data:{event:'COMPLETE',detail:'All joined-wallet 1 TRX payouts confirmed'}});
           });
         }

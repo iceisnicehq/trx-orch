@@ -8,6 +8,10 @@ services:
       TRON_FULL_HOST: ${TRON_FULL_HOST:-https://api.trongrid.io}
       TRON_PRO_API_KEY: ${TRON_PRO_API_KEY:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:-}
+      TELEGRAM_PINNED_MESSAGE_ID: ${TELEGRAM_PINNED_MESSAGE_ID:-}
+      TELEGRAM_DASHBOARD_URL: ${TELEGRAM_DASHBOARD_URL:-}
       WALLETS_FILE: /app/config/wallets.json
     volumes:
       - db-data:/data

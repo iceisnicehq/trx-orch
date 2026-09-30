@@ -13,7 +13,8 @@ test('node transfer history pages through every record without losing rows when 
   try{
     const migrations=['20260926000000_init','20260928000000_dynamic_members',
       '20260929000000_bandwidth_receipts','20260929010000_bandwidth_block_time',
-      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes'];
+      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes',
+      '20260930000000_external_extra_reserves'];
     const sql=(await Promise.all(migrations.map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
     execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
     db=new PrismaClient();
@@ -34,6 +35,14 @@ test('node transfer history pages through every record without losing rows when 
     const recipient=await nodeHistory(db,b);
     strictEqual(recipient.total,112,'Only transfers touching the chosen node appear');
     strictEqual(Object.hasOwn(refreshed.items[0],'signedJson'),false,'Never expose signed payloads');
+    const confirmed=await nodeHistory(db,a,undefined,'CONFIRMED');
+    strictEqual(confirmed.total,96,'Filter count must include older confirmed transfers, not just the first page');
+    strictEqual(confirmed.items.length,50);
+    const older=await nodeHistory(db,a,confirmed.nextBefore!,'CONFIRMED');
+    strictEqual(older.items.length,46);strictEqual(older.nextBefore,null);
+    strictEqual([...confirmed.items,...older.items].every(t=>t.status==='CONFIRMED'),true);
+    strictEqual(new Set([...confirmed.items,...older.items].map(t=>t.sequence)).size,96);
+    strictEqual((await nodeHistory(db,a,undefined,'CONFIRMED')).total,96,'New planned rows cannot change the confirmed count');
   }finally{
     await db?.$disconnect();
     await rm(directory,{recursive:true,force:true});

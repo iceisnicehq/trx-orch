@@ -7,9 +7,11 @@ type Wallet={address:string;ordinal:number;autoApprove:boolean;mixEnabled:boolea
 type AmountMode='RANDOM'|'LIST';
 type State={mode:string;phase:string;status:string;fatalReason:string|null;teacherAddress:string;expectedPoolSun:number;poolSun:number;reserveSun:number;configuredSun:number;selectedCount:number;joinedCount:number;wallets:Wallet[];updatedAt:string;mixAmountMode:AmountMode;mixAmountListSun:number[];mixAmountCursor:number;rebalanceTotal:number;rebalanceDone:number};
 type RebalancePreview={pendingReceipt:boolean;transferCount:number|null;steps:{from:string;to:string;amountSun:number}[]};
+type ExtraRecoveryPreview={eligible:boolean;reason:string|null;phase:string|null;extras:{address:string;sun:number}[];totalExtraSun:number};
 type Edge=GraphEdge;
 type HistoryTransfer=GraphEdge & {createdAt:string;updatedAt:string};
 type NodeHistory={address:string;total:number;items:HistoryTransfer[];nextBefore:number|null};
+type HistoryStatus='CONFIRMED'|'ALL';
 type Event={id:number;at:string;event:string;detail:string};
 const fmt=(sun:number)=>`${(sun/1_000_000).toFixed(6)} TRX`;
 const short=(s:string)=>s.length>20?`${s.slice(0,7)}…${s.slice(-6)}`:s;
@@ -18,24 +20,39 @@ const whenMSK=(v:string)=>`${new Date(v).toLocaleString('en-GB',{timeZone:'Europ
 async function get<T>(path:string):Promise<T>{const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw Error(await r.text());return r.json();}
 async function post(path:string,body:object){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error??`HTTP ${r.status}`);return j;}
 
+function TransferChain({items,label,nodeLabel}:{items:GraphEdge[];label:string;nodeLabel:(address:string)=>string}){
+  if(!items.length)return null;
+  return <section className="transfer-chain" aria-label={label}>
+    <span className="eyebrow">{label} · oldest → newest</span>
+    <ol className="chain-steps">{[...items].reverse().map(t=><li key={t.id}>
+      <small>#{t.sequence} · {t.kind}</small>
+      <strong>{nodeLabel(t.from)} <span aria-hidden="true">→</span> {nodeLabel(t.to)}</strong>
+      <span>{fmt(t.amountSun)}</span>
+    </li>)}</ol>
+  </section>;
+}
+
 function App(){
   const [state,setState]=useState<State|null>(null),[graph,setGraph]=useState<Graph>({nodes:[],edges:[]}),[queue,setQueue]=useState<Edge[]>([]);
   const [graphMode,setGraphMode]=useState<GraphMode>('forecast'),[routeId,setRouteId]=useState<string|null>(null),[layoutVersion,setLayoutVersion]=useState(0);
   const [logs,setLogs]=useState<{events:Event[];transfers:Edge[]}>({events:[],transfers:[]}),[node,setNode]=useState('all'),[page,setPage]=useState(0);
+  const [logStatus,setLogStatus]=useState<HistoryStatus>('CONFIRMED');
   const [error,setError]=useState(''),[modalError,setModalError]=useState(''),[modal,setModal]=useState<{title:string;path:string;body:object}|null>(null),[password,setPassword]=useState(''),[working,setWorking]=useState(false);
   const [amountMode,setAmountMode]=useState<AmountMode>('RANDOM'),[amountLines,setAmountLines]=useState('1\n0.5');
   const [rebalancePreview,setRebalancePreview]=useState<RebalancePreview|null>(null),[previewWorking,setPreviewWorking]=useState(false);
+  const [extraRecovery,setExtraRecovery]=useState<ExtraRecoveryPreview|null>(null),[recoveryWorking,setRecoveryWorking]=useState(false);
   const [historyAddress,setHistoryAddress]=useState<string|null>(null),[historyRows,setHistoryRows]=useState<HistoryTransfer[]>([]);
+  const [historyStatus,setHistoryStatus]=useState<HistoryStatus>('CONFIRMED');
   const [historyNext,setHistoryNext]=useState<number|null>(null),[historyTotal,setHistoryTotal]=useState(0),[historyLoading,setHistoryLoading]=useState(false),[historyError,setHistoryError]=useState('');
   const refreshId=useRef(0);
   const historyRequestId=useRef(0);
   const priorPhase=useRef<string|null>(null);
   const refresh=useCallback(async()=>{const id=++refreshId.current;try{
-    const [s,g,q,l]=await Promise.all([get<State>('/api/state'),get<Graph>('/api/graph'),get<Edge[]>('/api/queue'),get<{events:Event[];transfers:Edge[]}>(`/api/logs/${encodeURIComponent(node)}?page=${page}`)]);
+    const [s,g,q,l]=await Promise.all([get<State>('/api/state'),get<Graph>('/api/graph'),get<Edge[]>('/api/queue'),get<{events:Event[];transfers:Edge[]}>(`/api/logs/${encodeURIComponent(node)}?page=${page}&status=${logStatus}`)]);
     if(id!==refreshId.current)return;
     setState(s);setGraph(g);setQueue(q);setLogs(l);
     setError(previous=>previous.startsWith('Cannot refresh:')?'':previous);
-  }catch(e){if(id===refreshId.current)setError(`Cannot refresh: ${String(e)}`);}},[node,page]);
+  }catch(e){if(id===refreshId.current)setError(`Cannot refresh: ${String(e)}`);}},[node,page,logStatus]);
   useEffect(()=>{void refresh();const id=setInterval(()=>void refresh(),5000);return()=>clearInterval(id);},[refresh]);
   useEffect(()=>{if(!state)return;const phase=state.phase;
     if(['END_REQUESTED','SETTLING','REBALANCE_REQUESTED','REBALANCING'].includes(phase)){setGraphMode('settlement');setRouteId(null);}
@@ -48,19 +65,23 @@ function App(){
     const request=++historyRequestId.current;
     setHistoryLoading(true);setHistoryError('');
     try{
-      const result=await get<NodeHistory>(`/api/history/${encodeURIComponent(address)}${before===undefined?'':`?before=${before}`}`);
+      const result=await get<NodeHistory>(`/api/history/${encodeURIComponent(address)}?status=${historyStatus}${before===undefined?'':`&before=${before}`}`);
       if(request!==historyRequestId.current)return;
       setHistoryRows(previous=>before===undefined?result.items:[...previous,...result.items]);
       setHistoryNext(result.nextBefore);setHistoryTotal(result.total);
     }catch(e){if(request===historyRequestId.current)setHistoryError(`Cannot load node history: ${String(e)}`);}
     finally{if(request===historyRequestId.current)setHistoryLoading(false);}
-  },[]);
+  },[historyStatus]);
   useEffect(()=>{if(historyAddress){setHistoryRows([]);setHistoryNext(null);setHistoryTotal(0);void loadHistory(historyAddress);}
     return()=>{historyRequestId.current++;};
   },[historyAddress,loadHistory]);
-  const chooseNode=useCallback((address:string)=>{choose(address);setHistoryAddress(address);},[choose]);
+  const chooseNode=useCallback((address:string)=>{choose(address);setHistoryStatus('CONFIRMED');setHistoryAddress(address);},[choose]);
   const pending=useMemo(()=>queue.filter(q=>q.status==='PLANNED'),[queue]);
   const routes=useMemo(()=>groupRoutes(graph,graphMode),[graph,graphMode]);
+  const visibleTransferCount=routes.reduce((sum,route)=>sum+route.count,0);
+  const visibleVolumeSun=routes.reduce((sum,route)=>sum+route.totalSun,0);
+  const recentConfirmed=useMemo(()=>graph.edges.filter(t=>t.status==='CONFIRMED').sort((a,b)=>b.sequence-a.sequence).slice(0,6),[graph]);
+  const nodeConfirmed=historyRows.filter(t=>t.status==='CONFIRMED').slice(0,6);
   const selectedRoute=routes.find(route=>route.id===routeId);
   const nodeLabel=(address:string)=>graph.nodes.find(n=>n.id===address)?.label??short(address);
   function ask(title:string,path:string,body:object={}){setPassword('');setModalError('');setModal({title,path,body});setError('');}
@@ -72,6 +93,11 @@ function App(){
   async function previewRebalance(){setPreviewWorking(true);setError('');try{const result=await get<RebalancePreview>('/api/rebalance/preview');setRebalancePreview(result);
     ask(result.pendingReceipt?'Rebalance after the pending receipt':`Rebalance · ${result.transferCount} transfer${result.transferCount===1?'':'s'}`,'/api/admin/rebalance');
   }catch(e){setError(`Cannot preview rebalance: ${String(e)}`);}finally{setPreviewWorking(false);}}
+  async function previewExtraRecovery(){setRecoveryWorking(true);setError('');try{
+    const result=await get<ExtraRecoveryPreview>('/api/recovery/preview');setExtraRecovery(result);
+    if(!result.eligible){setError(`Resume unavailable: ${result.reason}`);return;}
+    ask(`Reserve ${result.totalExtraSun} extra Sun and resume`,'/api/admin/resume-excess');
+  }catch(e){setError(`Cannot review halted game: ${String(e)}`);}finally{setRecoveryWorking(false);}}
   async function submit(e:React.FormEvent){e.preventDefault();if(!modal)return;setWorking(true);
     try{await post(modal.path,{...modal.body,password});setPassword('');setModalError('');setModal(null);setError('');await refresh();}
     catch(e){setModalError(String(e));}finally{setWorking(false);}
@@ -90,13 +116,15 @@ function App(){
       <div className="main-grid"><section className="panel graphpanel"><div className="section-head"><div><span className="eyebrow">NETWORK MAP</span><h2>Transfer flow</h2></div><div className="legend"><span><i className="hist"/>Executed</span><span><i className="plan"/>Planned</span><span><i className="settle"/>Settlement</span></div></div>
         <div className="graph-tools" role="group" aria-label="Graph transfer filter">{([['forecast','Upcoming'],['history','Executed'],['settlement','Settlement'],['all','All']] as const).map(([mode,label])=><button key={mode} className={graphMode===mode?'active':''} aria-pressed={graphMode===mode} onClick={()=>{setGraphMode(mode);setRouteId(null)}}>{label}</button>)}</div>
         <Network graph={graph} routes={routes} selected={node} selectedRouteId={selectedRoute?.id??null} onSelect={chooseNode} onRouteSelect={setRouteId} layoutVersion={layoutVersion}/>
-        <div className="graph-summary"><span>{routes.reduce((sum,route)=>sum+route.count,0)} transfers on {routes.length} routes · numbered circles are wallets · T is the teacher</span><button onClick={()=>{setLayoutVersion(v=>v+1);setRouteId(null)}}>Reset layout</button></div>
-        <div className="route-list" aria-label="Visible transfer routes">{routes.length?routes.map(route=><button key={route.id} className={selectedRoute?.id===route.id?'active':''} onClick={()=>setRouteId(route.id)}>{nodeLabel(route.from)} → {nodeLabel(route.to)} <b>{route.count} tx</b></button>):<span>No transfers in this view.</span>}</div>
+        <div className="graph-summary"><span>{visibleTransferCount} {visibleTransferCount===1?'transfer':'transfers'} on {routes.length} {routes.length===1?'route':'routes'} · {fmt(visibleVolumeSun)} total · numbered circles are wallets · T is the teacher</span><button onClick={()=>{setLayoutVersion(v=>v+1);setRouteId(null)}}>Reset layout</button></div>
+        <div className="route-list" aria-label="Visible transfer routes">{routes.length?routes.map(route=><button key={route.id} className={selectedRoute?.id===route.id?'active':''} onClick={()=>setRouteId(route.id)}>{nodeLabel(route.from)} → {nodeLabel(route.to)} <b>{fmt(route.totalSun)} · {route.count} tx</b></button>):<span>No transfers in this view.</span>}</div>
+        <TransferChain items={recentConfirmed} label="Recent confirmed transfers" nodeLabel={nodeLabel}/>
         {selectedRoute?<div className="route-detail"><strong>{nodeLabel(selectedRoute.from)} → {nodeLabel(selectedRoute.to)} · {selectedRoute.kind} · {fmt(selectedRoute.totalSun)} total</strong><div className="route-rows">{selectedRoute.transfers.map(t=><span key={t.id}>#{t.sequence} · {fmt(t.amountSun)} · {t.status} · {when(t.scheduledAt)}</span>)}</div></div>:<p className="hint">Select a line or route for individual transfers. Click a wallet to open its complete transfer history. Drag wallets to rearrange them; their positions stay in this browser.</p>}</section>
         <aside className="panel controls">
           <span className="eyebrow">CONTROL ROOM</span><h2>Game controls</h2>
           <p>Choose at least two activated wallets with 1 TRX each. Manual approval is the default. Each control asks for the admin password.</p>
           <div className="actions"><button onClick={()=>ask('Start daily mixing','/api/admin/start')} disabled={state?.phase!=='IDLE'||state.selectedCount<2}>▶ Start</button><button className="replan" onClick={()=>ask('Regenerate the pending mix plan','/api/admin/replan')} disabled={state?.phase!=='MIXING'||state.selectedCount<2}>↻ Replan</button><button className="rebalance" onClick={()=>void previewRebalance()} disabled={state?.phase!=='MIXING'||previewWorking}>{previewWorking?'Calculating…':'⇄ Rebalance'}</button><button className="end" onClick={()=>{setRebalancePreview(null);ask('End and settle pool','/api/admin/end')}} disabled={!['MIXING','REBALANCE_REQUESTED','REBALANCING'].includes(state?.phase??'')}>◆ End game</button></div>
+          {state?.phase==='HALTED'&&<div className="halted-recovery"><strong>Game halted</strong><p>Review the on-chain balances against recorded transfers. A positive-only difference can be protected as personal extra Sun before resuming; other failures remain halted.</p><button onClick={()=>void previewExtraRecovery()} disabled={recoveryWorking}>{recoveryWorking?'Checking balances…':'Review extra Sun & resume'}</button></div>}
           <div className="amount-control"><span className="eyebrow">MIX AMOUNTS</span><h3>Transfer size</h3><p>Random keeps the current small fractional amounts and 1–2 hour gaps. List uses your exact values without an artificial delay when a funded sender has enough free Bandwidth. Only 1 or 0.5 TRX is accepted.</p>
             <div className="amount-options" role="group" aria-label="Mix amount mode"><label><input type="radio" name="amountMode" checked={amountMode==='RANDOM'} onChange={()=>setAmountMode('RANDOM')}/> RANDOM</label><label><input type="radio" name="amountMode" checked={amountMode==='LIST'} onChange={()=>setAmountMode('LIST')}/> LIST</label></div>
             {amountMode==='LIST'&&<><label className="amount-label" htmlFor="amount-lines">Amounts (TRX), one per line</label><textarea id="amount-lines" value={amountLines} onChange={e=>setAmountLines(e.target.value)} rows={4} spellCheck={false} placeholder={'1\n0.5'} aria-describedby="amount-help"/><small id="amount-help" className="amount-help">One pending MIX for the whole game. Ready senders with more free Bandwidth go first; the last recipient wins ties. Each next step waits for the previous receipt.</small></>}
@@ -115,13 +143,15 @@ function App(){
           </div>)}</div>
         </aside></div>
       <div className="bottom-grid"><section className="panel"><div className="section-head"><div><span className="eyebrow">REVIEW DESK</span><h2>Transaction queue</h2></div><span className="count">{queue.length} open</span></div><div className="table-wrap"><table><thead><tr><th>SEQ / TYPE</th><th>ROUTE</th><th>AMOUNT</th><th>SCHEDULE</th><th>STATE</th><th></th></tr></thead><tbody>{queue.length?queue.map(q=><tr key={q.id}><td><b>#{q.sequence}</b><small>{q.kind}</small></td><td className="route" title={`${q.from} → ${q.to}`}>{short(q.from)} → {short(q.to)}</td><td>{fmt(q.amountSun)}</td><td title={when(q.scheduledAt)}>{q.kind==='MIX'&&state?.mixAmountMode==='LIST'&&new Date(q.scheduledAt).getTime()<=Date.now()?'Due now':when(q.scheduledAt)}</td><td><span className={'tag '+q.status.toLowerCase()}>{q.status}</span>{q.note&&<small className="queue-note" title={q.note}>{q.note}</small>}</td><td>{q.status==='PLANNED'&&<button className="mini" onClick={()=>ask(`Approve #${q.sequence} · ${fmt(q.amountSun)}`,`/api/admin/queue/${q.id}/approve`)}>Approve</button>}</td></tr>):<tr><td colSpan={6} className="empty">No transfers awaiting execution.</td></tr>}</tbody></table></div></section>
-      <section className="panel"><div className="section-head"><div><span className="eyebrow">PUBLIC AUDIT</span><h2>Node history</h2></div><select aria-label="Filter logs by node" value={node} onChange={e=>choose(e.target.value)}><option value="all">All nodes</option>{state?.wallets.map(w=><option key={w.address} value={w.address}>Node {w.ordinal+1}</option>)}{state&&<option value={state.teacherAddress}>Teacher</option>}</select></div><div className="loglist">{logs.transfers.length?logs.transfers.map(t=><div className="log" key={t.id}><span className={'dot '+(t.status==='CONFIRMED'?'done':'')}/><div><b>{t.kind} · {fmt(t.amountSun)}</b><small>{short(t.from)} → {short(t.to)} · {t.status}</small>{t.status==='CONFIRMED'&&<small>{t.bandwidthUsed===null||t.bandwidthUsed===undefined?'Bandwidth unavailable from receipt':`${t.bandwidthUsed} Bandwidth used`} · 0 Sun fee</small>}{t.txId&&<small title={t.txId}>TX {short(t.txId)}</small>}</div><time>{when(t.confirmedAt??t.updatedAt??t.scheduledAt)}</time></div>):<p className="empty">No transfers recorded.</p>}{logs.events.length>0&&<><h3 className="audit-title">System events</h3>{logs.events.map(e=><div className="event" key={e.id}><b>{e.event}</b><span>{e.detail}</span><time>{when(e.at)}</time></div>)}</>}</div><div className="pager"><button disabled={page===0} onClick={()=>setPage(page-1)}>Previous</button><span>Page {page+1}</span><button disabled={logs.transfers.length<100&&logs.events.length<100} onClick={()=>setPage(page+1)}>Next</button></div></section></div>
+      <section className="panel"><div className="section-head"><div><span className="eyebrow">PUBLIC AUDIT</span><h2>Node history</h2></div><select aria-label="Filter logs by node" value={node} onChange={e=>choose(e.target.value)}><option value="all">All nodes</option>{state?.wallets.map(w=><option key={w.address} value={w.address}>Node {w.ordinal+1}</option>)}{state&&<option value={state.teacherAddress}>Teacher</option>}</select></div><div className="history-filters" role="group" aria-label="Filter public transfer log">{(['CONFIRMED','ALL'] as const).map(status=><button key={status} type="button" aria-pressed={logStatus===status} className={logStatus===status?'active':''} onClick={()=>{setLogStatus(status);setPage(0);setLogs(previous=>({...previous,transfers:[]}));}}>{status==='CONFIRMED'?'Confirmed':'All'}</button>)}</div><div className="loglist">{logs.transfers.length?logs.transfers.map(t=><div className="log" key={t.id}><span className={'dot '+(t.status==='CONFIRMED'?'done':'')}/><div><b>{t.kind} · {fmt(t.amountSun)}</b><small>{short(t.from)} → {short(t.to)} · {t.status}</small>{t.status==='CONFIRMED'&&<small>{t.bandwidthUsed===null||t.bandwidthUsed===undefined?'Bandwidth unavailable from receipt':`${t.bandwidthUsed} Bandwidth used`} · 0 Sun fee</small>}{t.txId&&<small title={t.txId}>TX {short(t.txId)}</small>}</div><time>{when(t.confirmedAt??t.updatedAt??t.scheduledAt)}</time></div>):<p className="empty">{logStatus==='CONFIRMED'?'No confirmed transfers in this view.':'No transfers recorded.'}</p>}{logs.events.length>0&&<><h3 className="audit-title">System events</h3>{logs.events.map(e=><div className="event" key={e.id}><b>{e.event}</b><span>{e.detail}</span><time>{when(e.at)}</time></div>)}</>}</div><div className="pager"><button disabled={page===0} onClick={()=>setPage(page-1)}>Previous</button><span>Page {page+1}</span><button disabled={logs.transfers.length<100&&logs.events.length<100} onClick={()=>setPage(page+1)}>Next</button></div></section></div>
       <footer>Pool conservation is verified against the chain before each transfer. Broadcasting pauses when free bandwidth or receipt certainty is insufficient.</footer>
     </main>
     {historyAddress&&<div className="overlay history-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setHistoryAddress(null)}} onKeyDown={e=>{if(e.key==='Escape')setHistoryAddress(null)}}><section className="history-dialog" role="dialog" aria-modal="true" aria-label={`${nodeLabel(historyAddress)} transfer history`}>
-      <div className="section-head"><div><span className="eyebrow">NODE TRANSFER HISTORY</span><h2>{nodeLabel(historyAddress)} · {historyTotal} records</h2></div><button className="history-close" aria-label="Close history" autoFocus onClick={()=>setHistoryAddress(null)}>×</button></div>
-      <p className="history-address">{historyAddress}</p><p className="history-intro">All recorded transfers involving this address, including confirmed transactions, pending approvals and cancelled plans. Times are Moscow (MSK). Load older to see the entire history.</p>
+      <div className="section-head"><div><span className="eyebrow">NODE TRANSFER HISTORY</span><h2>{nodeLabel(historyAddress)} · {historyTotal} {historyStatus==='CONFIRMED'?'confirmed':'total'} records</h2></div><button className="history-close" aria-label="Close history" autoFocus onClick={()=>setHistoryAddress(null)}>×</button></div>
+      <p className="history-address">{historyAddress}</p><p className="history-intro">Confirmed transfers are shown first. All includes open and cancelled plans. Times are Moscow (MSK); Load older pages through the selected view.</p>
+      <div className="history-filters" role="group" aria-label="Filter node transfer history">{(['CONFIRMED','ALL'] as const).map(status=><button key={status} type="button" aria-pressed={historyStatus===status} className={historyStatus===status?'active':''} onClick={()=>setHistoryStatus(status)}>{status==='CONFIRMED'?'Confirmed':'All'}</button>)}</div>
       {historyError&&<div className="error" role="alert">{historyError}</div>}
+      <TransferChain items={nodeConfirmed} label={`Recent confirmed flow for ${nodeLabel(historyAddress)}`} nodeLabel={nodeLabel}/>
       <div className="history-records" role="list">{historyRows.map(t=><div className="history-record" role="listitem" key={t.id}>
         <div className="history-record-title"><b>#{t.sequence} · {t.from===historyAddress?'OUT':'IN'} · {t.kind}</b><span className={'tag '+t.status.toLowerCase()}>{t.status}</span></div>
         <strong>{nodeLabel(t.from)} → {nodeLabel(t.to)} · {fmt(t.amountSun)}</strong>
@@ -129,10 +159,10 @@ function App(){
         <small>{t.confirmedAt?'Confirmed':t.status==='CANCELLED'?'Cancelled / updated':'Last updated'}: {whenMSK(t.confirmedAt??t.updatedAt)} · Scheduled: {whenMSK(t.scheduledAt)}</small>
         {t.status==='CONFIRMED'&&<small>{t.bandwidthUsed==null?'Bandwidth unavailable from receipt':`${t.bandwidthUsed} Bandwidth used`} · 0 Sun fee</small>}
         {t.txId&&<small className="history-tx">TX: {t.txId}</small>}{t.note&&<small>{t.note}</small>}
-      </div>)}{!historyLoading&&!historyRows.length&&!historyError&&<p className="empty">No transfers recorded for this node.</p>}</div>
+      </div>)}{!historyLoading&&!historyRows.length&&!historyError&&<p className="empty">{historyStatus==='CONFIRMED'?'No confirmed transfers for this node.':'No transfers recorded for this node.'}</p>}</div>
       <div className="history-actions"><span>{historyRows.length} of {historyTotal} shown</span><button disabled={historyLoading} onClick={()=>void loadHistory(historyAddress)}>Refresh</button>{historyNext!==null&&<button disabled={historyLoading} onClick={()=>void loadHistory(historyAddress,historyNext)}>Load older</button>}{historyLoading&&<span>Loading…</span>}</div>
     </section></div>}
-    {modal&&<div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setModal(null)}}><form className="dialog" onSubmit={submit}><span className="eyebrow">ADMIN AUTHORIZATION</span><h2>{modal.title}</h2><p>{modal.path==='/api/admin/replan'?'This cancels pending MIX transfers, including approved ones, then creates a fresh queue. Confirmed transfers stay in the audit log.':modal.path==='/api/admin/mix-amounts'?'Saving cancels unsent MIX transfers and their approvals. New rows follow the chosen amount mode; a transfer already in flight must first be confirmed.':modal.path==='/api/admin/rebalance'?'The count below is a preview from current confirmed chain balances. Unsent MIX and their approvals are cancelled. A submitted MIX finishes first, so the final count may change. Rebalance steps require Approve unless each sender has Auto enabled. Mixing resumes once all steps are confirmed.':'This action changes the transaction engine. Enter the admin password to continue.'}</p>{modal.path==='/api/admin/rebalance'&&rebalancePreview&&<div className="preview-details"><strong>{rebalancePreview.pendingReceipt?'Exact transfer count will be known after the pending receipt.':`${rebalancePreview.transferCount} internal transfer${rebalancePreview.transferCount===1?'':'s'} to restore each joined wallet to 1 TRX plus its original extra Sun.`}</strong>{rebalancePreview.steps.length>0&&<div className="preview-steps">{rebalancePreview.steps.map((step,index)=><span key={`${index}-${step.from}`}>{index+1}. {short(step.from)} → {short(step.to)} · {fmt(step.amountSun)}</span>)}</div>}</div>}{modalError&&<div className="error" role="alert">{modalError}</div>}<label htmlFor="password">Password</label><input id="password" type="password" autoComplete="off" autoFocus required value={password} onChange={e=>setPassword(e.target.value)}/><div className="dialog-actions"><button type="button" className="cancel" onClick={()=>setModal(null)}>Cancel</button><button type="submit" disabled={working}>{working?'Working…':'Confirm'}</button></div></form></div>}
+    {modal&&<div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setModal(null)}}><form className="dialog" onSubmit={submit}><span className="eyebrow">ADMIN AUTHORIZATION</span><h2>{modal.title}</h2><p>{modal.path==='/api/admin/replan'?'This cancels pending MIX transfers, including approved ones, then creates a fresh queue. Confirmed transfers stay in the audit log.':modal.path==='/api/admin/mix-amounts'?'Saving cancels unsent MIX transfers and their approvals. New rows follow the chosen amount mode; a transfer already in flight must first be confirmed.':modal.path==='/api/admin/rebalance'?'The count below is a preview from current confirmed chain balances. Unsent MIX and their approvals are cancelled. A submitted MIX finishes first, so the final count may change. Rebalance steps require Approve unless each sender has Auto enabled. Mixing resumes once all steps are confirmed.':modal.path==='/api/admin/resume-excess'?'The balances and confirmed transfer ledger will be checked again. Only positive surplus is added to each wallet’s protected extra Sun. Existing transfers and approvals remain. Autoapproved MIX can run as soon as the engine resumes.':'This action changes the transaction engine. Enter the admin password to continue.'}</p>{modal.path==='/api/admin/rebalance'&&rebalancePreview&&<div className="preview-details"><strong>{rebalancePreview.pendingReceipt?'Exact transfer count will be known after the pending receipt.':`${rebalancePreview.transferCount} internal transfer${rebalancePreview.transferCount===1?'':'s'} to restore each joined wallet to 1 TRX plus its protected extra Sun.`}</strong>{rebalancePreview.steps.length>0&&<div className="preview-steps">{rebalancePreview.steps.map((step,index)=><span key={`${index}-${step.from}`}>{index+1}. {short(step.from)} → {short(step.to)} · {fmt(step.amountSun)}</span>)}</div>}</div>}{modal.path==='/api/admin/resume-excess'&&extraRecovery&&<div className="preview-details"><strong>Resume {extraRecovery.phase} · protect {extraRecovery.totalExtraSun} extra Sun · no teacher payout</strong><div className="preview-steps">{extraRecovery.extras.map(w=><span key={w.address}>{nodeLabel(w.address)} ({short(w.address)}): +{w.sun} Sun reserved</span>)}{!extraRecovery.extras.length&&<span>No new extra Sun remains; the current balances match the ledger.</span>}</div></div>}{modalError&&<div className="error" role="alert">{modalError}</div>}<label htmlFor="password">Password</label><input id="password" type="password" autoComplete="off" autoFocus required value={password} onChange={e=>setPassword(e.target.value)}/><div className="dialog-actions"><button type="button" className="cancel" onClick={()=>setModal(null)}>Cancel</button><button type="submit" disabled={working}>{working?'Working…':'Confirm'}</button></div></form></div>}
   </div>;
 }
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App/></React.StrictMode>);

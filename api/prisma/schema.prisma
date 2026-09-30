@@ -52,6 +52,7 @@ model EngineState {
   rebalanceFromSequence Int? // first sequence in this rebalance batch
   settlementFromSequence Int? // first sequence in this end-game batch
   fatalReason     String?
+  haltedFromPhase String? // durable pre-HALT phase; used only for guarded reserve recovery
   updatedAt       DateTime @updatedAt
 }
 

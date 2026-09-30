@@ -1,10 +1,12 @@
 import type {PrismaClient,Prisma} from '@prisma/client';
 
 const PAGE_SIZE=50;
+export type HistoryStatus='ALL'|'CONFIRMED';
 
 /** Transfer history is cursor-paged so long-running games remain readable. */
-export async function nodeHistory(db:PrismaClient,address:string,before?:number){
-  const participant:Prisma.TransferWhereInput={OR:[{from:address},{to:address}]};
+export async function nodeHistory(db:PrismaClient,address:string,before?:number,status:HistoryStatus='ALL'){
+  const participant:Prisma.TransferWhereInput={OR:[{from:address},{to:address}],
+    ...(status==='CONFIRMED'?{status:'CONFIRMED'}:{})};
   const where:Prisma.TransferWhereInput={...participant,...(before===undefined?{}:{sequence:{lt:before}})};
   const [total,rows]=await Promise.all([
     db.transfer.count({where:participant}),

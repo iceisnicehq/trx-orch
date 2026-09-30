@@ -59,6 +59,7 @@ app.get('/api/graph',asyncRoute(async(_req,res)=>{
     edges:transfers.filter(t=>t.status!=='CANCELLED')});
 }));
 app.get('/api/rebalance/preview',asyncRoute(async(_req,res)=>res.json(await engine.rebalancePreview())));
+app.get('/api/recovery/preview',asyncRoute(async(_req,res)=>res.json(await engine.extraRecoveryPreview())));
 app.get('/api/queue',asyncRoute(async(_req,res)=>{
   const rows=await db.transfer.findMany({where:{status:{in:['PLANNED','APPROVED','PAUSED','SUBMITTED','SUBMITTING','UNKNOWN']}},orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,note:true,txId:true}});
   res.json(rows);
@@ -67,21 +68,25 @@ app.get('/api/history/:address',asyncRoute(async(req,res)=>{
   const address=req.params.address;
   if(!config.wallets.some(w=>w.address===address)&&address!==config.teacherAddress)throw new HttpError(404,'Unknown node');
   const before=req.query.before===undefined?undefined:z.coerce.number().int().positive().safe().parse(req.query.before);
-  res.json(await nodeHistory(db,address,before));
+  const status=z.enum(['ALL','CONFIRMED']).parse(req.query.status??'ALL');
+  res.json(await nodeHistory(db,address,before,status));
 }));
 app.get('/api/logs/:address',asyncRoute(async(req,res)=>{
   const address=req.params.address;
   if(address!=='all'&&!config.wallets.some(w=>w.address===address)&&address!==config.teacherAddress)throw new HttpError(404,'Unknown node');
   const page=z.coerce.number().int().min(0).max(100000).parse(req.query.page??0);
+  const status=z.enum(['ALL','CONFIRMED']).parse(req.query.status??'ALL');
   const [events,transfers]=await Promise.all([
     db.audit.findMany({orderBy:{id:'desc'},take:100,skip:page*100,where:address==='all'?{}:{detail:{contains:address}}}),
-    db.transfer.findMany({where:address==='all'?{}:{OR:[{from:address},{to:address}]},orderBy:{sequence:'desc'},take:100,skip:page*100,select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,txId:true,note:true,bandwidthUsed:true,confirmedAt:true,scheduledAt:true,updatedAt:true}})
+    db.transfer.findMany({where:{...(address==='all'?{}:{OR:[{from:address},{to:address}]}),
+      ...(status==='CONFIRMED'?{status:'CONFIRMED'}:{})},orderBy:{sequence:'desc'},take:100,skip:page*100,select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,txId:true,note:true,bandwidthUsed:true,confirmedAt:true,scheduledAt:true,updatedAt:true}})
   ]);
   res.json({events,transfers});
 }));
 app.post('/api/admin/start',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.start())));
 app.post('/api/admin/replan',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.replan())));
 app.post('/api/admin/rebalance',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.rebalance())));
+app.post('/api/admin/resume-excess',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.resumeExtraReserves())));
 app.post('/api/admin/mix-amounts',requirePassword,asyncRoute(async(req,res)=>{
   const body=z.object({mode:z.enum(['RANDOM','LIST']),amountsSun:z.array(z.union([z.literal(500_000),z.literal(1_000_000)])).min(1).max(64).optional()}).parse(req.body);
   res.json(await engine.setMixAmounts(body.mode,body.amountsSun));

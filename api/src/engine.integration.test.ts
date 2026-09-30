@@ -19,7 +19,8 @@ test('two-wallet start, later join, replan, manual approvals and exact payouts',
       readFile('prisma/migrations/20260929000000_bandwidth_receipts/migration.sql','utf8'),
       readFile('prisma/migrations/20260929010000_bandwidth_block_time/migration.sql','utf8'),
       readFile('prisma/migrations/20260929020000_telegram_notifications/migration.sql','utf8'),
-      readFile('prisma/migrations/20260929030000_rebalance_and_amount_modes/migration.sql','utf8')
+      readFile('prisma/migrations/20260929030000_rebalance_and_amount_modes/migration.sql','utf8'),
+      readFile('prisma/migrations/20260930000000_external_extra_reserves/migration.sql','utf8')
     ])).join('\n');
     execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
     const [{loadConfig,TARGET},{TronService},{EngineService}]=await Promise.all([

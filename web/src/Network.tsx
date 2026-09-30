@@ -118,7 +118,7 @@ export function Network({graph,routes,selected,selectedRouteId,onSelect,onRouteS
         }else instance.add({group:'nodes',data,position});
       }
       for(const route of routes){
-        const label=`${route.count} × ${(route.totalSun/1_000_000).toFixed(6)} TRX total`;
+        const label=`${(route.totalSun/1_000_000).toFixed(6)} TRX total · ${route.count} tx`;
         const element=instance.getElementById(route.id);
         if(element.length){element.data('count',route.count);element.data('label',label);}
         else instance.add({group:'edges',data:{id:route.id,source:route.from,target:route.to,kind:route.kind,phase:route.phase,count:route.count,label}});

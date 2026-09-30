@@ -13,7 +13,8 @@ test('fixed amount chain, rebalance recovery, and end-game map after rebalance',
   try{
     const migrations=['20260926000000_init','20260928000000_dynamic_members',
       '20260929000000_bandwidth_receipts','20260929010000_bandwidth_block_time',
-      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes'];
+      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes',
+      '20260930000000_external_extra_reserves'];
     const sql=(await Promise.all(migrations.map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
     execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
     const [{loadConfig,TARGET},{TronService},{EngineService}]=await Promise.all([
@@ -100,7 +101,8 @@ test('end during rebalance cancels its open map and creates a fresh payout map',
   try{
     const migrations=['20260926000000_init','20260928000000_dynamic_members',
       '20260929000000_bandwidth_receipts','20260929010000_bandwidth_block_time',
-      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes'];
+      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes',
+      '20260930000000_external_extra_reserves'];
     const sql=(await Promise.all(migrations.map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
     execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
     const [{loadConfig,TARGET},{TronService},{EngineService}]=await Promise.all([
@@ -146,7 +148,8 @@ test('LIST uses a funded high-bandwidth sender immediately and forecasts the soo
   try{
     const migrations=['20260926000000_init','20260928000000_dynamic_members',
       '20260929000000_bandwidth_receipts','20260929010000_bandwidth_block_time',
-      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes'];
+      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes',
+      '20260930000000_external_extra_reserves'];
     const sql=(await Promise.all(migrations.map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
     execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
     const [{loadConfig,TARGET},{TronService},{EngineService}]=await Promise.all([

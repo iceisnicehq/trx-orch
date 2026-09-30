@@ -15,7 +15,8 @@ test('Telegram edits a compact queue, sends audit details, and retries after res
     const sql=(await Promise.all([
       '20260926000000_init','20260928000000_dynamic_members',
       '20260929000000_bandwidth_receipts','20260929010000_bandwidth_block_time',
-      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes'
+      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes',
+      '20260930000000_external_extra_reserves'
     ].map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
     execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
     db=new PrismaClient();
