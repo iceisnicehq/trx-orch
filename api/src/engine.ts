@@ -47,10 +47,11 @@ export class EngineService {
         await this.audit('UPGRADE','Existing game retained all 17 wallets at their original 1 TRX entry balances');
       }
     }else{
-      const baseline=await this.tron.teacherBalance();
       await this.db.$transaction(async tx=>{
         for(let i=0;i<this.config.wallets.length;i++)await tx.wallet.create({data:{address:this.config.wallets[i].address,ordinal:i}});
-        await tx.engineState.create({data:{id:1,teacherAddress:this.config.teacherAddress,teacherBaseline:baseline,status:'Ready. Select at least two funded wallets, then Start.'}});
+        // Retain the legacy column for existing databases; a third-party
+        // recipient's unrelated balance cannot verify our individual payouts.
+        await tx.engineState.create({data:{id:1,teacherAddress:this.config.teacherAddress,teacherBaseline:0,status:'Ready. Select at least two funded wallets, then Start.'}});
         await tx.audit.create({data:{event:'INITIALIZED',detail:`${this.config.wallets.length} wallets configured; mode ${MODE}`}});
       },{timeout:30_000});
     }
@@ -96,7 +97,6 @@ export class EngineService {
     });
   }
   private async inspectPool():Promise<PoolReview>{
-    const s=await this.state();
     const joined=await this.joined();
     if(!joined.length||joined.some(w=>w.entryBalanceSun===null||w.entryBalanceSun<TARGET))return {ok:false,reason:'Pool has no valid joined-wallet baseline'};
     const b=await this.balances(joined), total=b.reduce((n,w)=>n+w.sun,0);
@@ -107,9 +107,9 @@ export class EngineService {
     const pendingSun=pending._sum.amountSun??0;
     if(total<expected-pendingSun||(pendingSun>0&&total>expected))
       return {ok:false,reason:`Pool invariant violated: ${total} Sun, expected ${expected}${pendingSun?` (up to ${pendingSun} in flight)`:''}`};
-    const teacher=await this.tron.teacherBalance();
-    const baseline=s.teacherBaseline+(paid._sum.amountSun??0);
-    if(teacher<baseline||teacher>baseline+pendingSun)return {ok:false,reason:'Teacher balance differs from attributed payouts'};
+    // The teacher controls this address independently. Its total balance is
+    // not an invariant of our pool. Payouts are counted only after their own
+    // persisted txID has a successful, zero-fee confirmed receipt.
     if(pendingSun===0){
       const expectedByWallet=new Map(joined.map(w=>[w.address,w.entryBalanceSun!]));
       const confirmed=await this.db.transfer.findMany({where:{status:'CONFIRMED'},select:{from:true,to:true,amountSun:true}});
@@ -135,7 +135,7 @@ export class EngineService {
     if(fresh.length!==review.balances.length||fresh.some((w,i)=>w.address!==review.balances[i].address||w.sun!==review.balances[i].sun))
       throw new HttpError(409,'Wallet balances changed while confirming extra Sun; retry shortly');
   }
-  private async saveExtraReserves(extras:ExtraReserve[],resumePhase?:string){
+  private async saveExtraReserves(extras:ExtraReserve[],resumePhase?:string,haltReason?:string){
     const sum=extras.reduce((n,w)=>n+w.sun,0);
     await this.db.$transaction(async tx=>{
       for(const w of extras){
@@ -143,10 +143,10 @@ export class EngineService {
         await tx.audit.create({data:{event:'EXTRA_RESERVE',detail:`${w.address}: ${w.sun} newly observed Sun protected as this wallet's personal reserve; game stake unchanged`}});
       }
       await tx.engineState.update({where:{id:1},data:{status:resumePhase?
-        `Verified ${sum} extra Sun as protected reserves; resuming ${resumePhase}`:
+        `Verified participant balances and confirmed transfers; ${sum} extra Sun protected; resuming ${resumePhase}`:
         `Verified ${sum} new Sun as protected wallet reserves; game stake unchanged`,
         ...(resumePhase?{phase:resumePhase,fatalReason:null,haltedFromPhase:null}:{}),lastPlanAt:null}});
-      if(resumePhase)await tx.audit.create({data:{event:'RESUMED',detail:`Guarded recovery to ${resumePhase}; ${sum} extra Sun protected; no transfers or approvals discarded`}});
+      if(resumePhase)await tx.audit.create({data:{event:'RESUMED',detail:`Guarded recovery from ${haltReason??'a verified halt'} to ${resumePhase}; ${sum} extra Sun protected; no transfers or approvals discarded`}});
     },{timeout:30_000});
     this.tron.invalidatePublicSnapshot();
   }
@@ -162,7 +162,8 @@ export class EngineService {
   private async extraRecoveryPhase(s:EngineState):Promise<string|null>{
     if(s.phase!=='HALTED'||!s.fatalReason)return null;
     const numbers=/^Pool invariant violated: (\d+) Sun, expected (\d+)$/.exec(s.fatalReason);
-    if(!numbers||Number(numbers[1])<=Number(numbers[2]))return null;
+    const oldTeacherCheck=s.fatalReason==='Teacher balance differs from attributed payouts';
+    if(!oldTeacherCheck&&(!numbers||Number(numbers[1])<=Number(numbers[2])))return null;
     if(s.haltedFromPhase)return RESUMABLE_PHASES.includes(s.haltedFromPhase)?s.haltedFromPhase:null;
     // Older releases did not persist the previous phase. Infer MIXING only
     // when there is no settlement marker, open settlement row, or paid wallet.
@@ -177,12 +178,12 @@ export class EngineService {
     const s=await this.state();
     if(s.phase!=='HALTED')throw new HttpError(409,'Recovery is available only for a halted game');
     const phase=await this.extraRecoveryPhase(s);
-    if(!phase)return {eligible:false,reason:'This halt cannot be recovered as extra Sun; investigate the original failure and any in-flight transactions',phase:null,extras:[] as ExtraReserve[],totalExtraSun:0};
+    if(!phase)return {eligible:false,reason:'This halt cannot be recovered automatically; investigate the original failure and any in-flight transactions',phase:null,extras:[] as ExtraReserve[],totalExtraSun:0,haltReason:s.fatalReason};
     const inFlight=await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}});
-    if(inFlight)return {eligible:false,reason:'An uncertain or submitted transfer must be resolved before recovery',phase:null,extras:[] as ExtraReserve[],totalExtraSun:0};
+    if(inFlight)return {eligible:false,reason:'An uncertain or submitted transfer must be resolved before recovery',phase:null,extras:[] as ExtraReserve[],totalExtraSun:0,haltReason:s.fatalReason};
     const review=await this.inspectPool();
-    if(!review.ok)return {eligible:false,reason:review.reason,phase:null,extras:[] as ExtraReserve[],totalExtraSun:0};
-    return {eligible:true,reason:null,phase,extras:review.extras,totalExtraSun:review.extras.reduce((n,w)=>n+w.sun,0),review};
+    if(!review.ok)return {eligible:false,reason:review.reason,phase:null,extras:[] as ExtraReserve[],totalExtraSun:0,haltReason:s.fatalReason};
+    return {eligible:true,reason:null,phase,extras:review.extras,totalExtraSun:review.extras.reduce((n,w)=>n+w.sun,0),haltReason:s.fatalReason,review};
   }
   async extraRecoveryPreview(){return this.withLock(async()=>{
     const {review:_,...preview}=await this.recoveryReview();
@@ -192,7 +193,7 @@ export class EngineService {
     const recovery=await this.recoveryReview();
     if(!recovery.eligible||!recovery.review||!recovery.phase)throw new HttpError(409,recovery.reason??'Extra reserve recovery is unavailable');
     await this.confirmExtraSnapshot(recovery.review);
-    await this.saveExtraReserves(recovery.extras,recovery.phase);
+    await this.saveExtraReserves(recovery.extras,recovery.phase,recovery.haltReason??undefined);
     await this.tickBody();
     return {ok:true,phase:recovery.phase,reservedSun:recovery.totalExtraSun};
   });}
@@ -206,13 +207,12 @@ export class EngineService {
     const b=await this.balances(selected);
     const unfunded=b.find(w=>w.sun<TARGET);
     if(unfunded)throw new HttpError(409,`Node ${selected.find(w=>w.address===unfunded.address)!.ordinal+1} needs at least 1 TRX to join`);
-    const teacherBaseline=await this.tron.teacherBalance();
     await this.db.$transaction(async tx=>{
       for(const w of b){
         await tx.wallet.update({where:{address:w.address},data:{joined:true,entryBalanceSun:w.sun}});
         await tx.audit.create({data:{event:'JOIN',detail:`${w.address} joined with 1 TRX; ${w.sun-TARGET} extra Sun reserved outside the game`}});
       }
-      await tx.engineState.update({where:{id:1},data:{phase:'MIXING',teacherBaseline,status:'Creating 24-hour transfer plan'}});
+      await tx.engineState.update({where:{id:1},data:{phase:'MIXING',status:'Creating 24-hour transfer plan'}});
       await tx.audit.create({data:{event:'START',detail:`Mixing started with ${b.length} wallets and ${b.length*TARGET} game Sun; ${b.reduce((n,w)=>n+w.sun-TARGET,0)} extra Sun reserved`}});
     },{timeout:30_000});
     await this.plan(b);

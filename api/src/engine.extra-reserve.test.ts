@@ -96,7 +96,7 @@ test('positive deposits cannot conceal a one-Sun deficit or bypass a different f
     strictEqual(s.phase,'HALTED');
     strictEqual(s.haltedFromPhase,'MIXING');
     strictEqual((await p.engine.extraRecoveryPreview()).eligible,false);
-    await rejects(p.engine.resumeExtraReserves(),/cannot be recovered as extra Sun/);
+    await rejects(p.engine.resumeExtraReserves(),/cannot be recovered automatically/);
     await p.db.engineState.update({where:{id:1},data:{fatalReason:'Receipt unresolved for a saved transaction'}});
     strictEqual((await p.engine.extraRecoveryPreview()).eligible,false);
     s=await p.db.engineState.findUniqueOrThrow({where:{id:1}});
@@ -148,5 +148,76 @@ test('extra Sun arriving after a saved Rebalance map stays on its wallet and mix
     strictEqual(wallet.balanceSnapshotSun,wallet.entryBalanceSun);
     strictEqual(wallet.entryBalanceSun,p.TARGET+2);
     strictEqual(await p.db.transfer.count({where:{kind:'REBALANCE'}}),1,'Keep the saved balancing route');
+  }finally{await p.db.$disconnect();await rm(p.directory,{recursive:true,force:true});}
+});
+
+test('teacher balance changes or RPC failure cannot halt mixing or exact payouts',async()=>{
+  const p=await pool();
+  try{
+    let teacherBalanceCalls=0;
+    p.tron.teacherBalance=async()=>{teacherBalanceCalls++;throw Error('Teacher balance is independently controlled');};
+    await p.engine.tick();
+    strictEqual((await p.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'MIXING');
+    p.tron.bandwidthSnapshot=async()=>({available:600,limit:600,observedAt:Date.now()});
+    await p.engine.end();
+    for(let i=0;i<8;i++){
+      if((await p.db.engineState.findUniqueOrThrow({where:{id:1}})).phase==='COMPLETE')break;
+      const next=await p.db.transfer.findFirst({where:{kind:'PAYOUT',status:'PLANNED'},orderBy:{sequence:'asc'}});
+      if(next)await p.engine.approve(next.id);
+      await p.engine.tick();
+    }
+    strictEqual((await p.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'COMPLETE');
+    strictEqual(await p.db.transfer.count({where:{kind:'PAYOUT',status:'CONFIRMED',amountSun:p.TARGET}}),2);
+    strictEqual(teacherBalanceCalls,0,'Do not use the teacher balance as a payout preflight');
+  }finally{await p.db.$disconnect();await rm(p.directory,{recursive:true,force:true});}
+});
+
+test('an existing teacher-balance HALT resumes after checking participant ledger, preserving the queue',async()=>{
+  const p=await pool();
+  try{
+    const planned=await p.db.transfer.findFirstOrThrow({where:{kind:'MIX',status:'PLANNED'}});
+    await p.db.engineState.update({where:{id:1},data:{phase:'HALTED',haltedFromPhase:'MIXING',
+      fatalReason:'Teacher balance differs from attributed payouts',status:'FATAL: Teacher balance differs from attributed payouts'}});
+    p.tron.teacherBalance=async()=>{throw Error('Teacher balance must not be queried during recovery');};
+    const {EngineService}=await import('./engine.js');
+    const afterRestart=new EngineService(p.db,p.tron,p.config);
+    await afterRestart.init();
+    const preview=await afterRestart.extraRecoveryPreview();
+    strictEqual(preview.eligible,true);strictEqual(preview.phase,'MIXING');
+    strictEqual(preview.haltReason,'Teacher balance differs from attributed payouts');
+    deepStrictEqual(preview.extras,[]);
+    await afterRestart.resumeExtraReserves();
+    const s=await p.db.engineState.findUniqueOrThrow({where:{id:1}});
+    strictEqual(s.phase,'MIXING');strictEqual(s.fatalReason,null);
+    strictEqual((await p.db.transfer.findUniqueOrThrow({where:{id:planned.id}})).status,'PLANNED');
+    strictEqual(await p.db.audit.count({where:{event:'RESUMED'}}),1);
+  }finally{await p.db.$disconnect();await rm(p.directory,{recursive:true,force:true});}
+});
+
+test('teacher-balance recovery does not override a participant deficit or rebuild saved payouts',async()=>{
+  const p=await pool();
+  try{
+    p.tron.bandwidthSnapshot=async()=>({available:600,limit:600,observedAt:Date.now()});
+    await p.engine.end();
+    const payouts=await p.db.transfer.findMany({where:{kind:'PAYOUT',status:'PLANNED'}});
+    strictEqual(payouts.length,2);
+    await p.db.engineState.update({where:{id:1},data:{phase:'HALTED',haltedFromPhase:'SETTLING',
+      fatalReason:'Teacher balance differs from attributed payouts'}});
+    await p.db.wallet.update({where:{address:p.members[0].address},data:{balanceSnapshotSun:{decrement:1}}});
+    strictEqual((await p.engine.extraRecoveryPreview()).eligible,false);
+    await rejects(p.engine.resumeExtraReserves(),/below its audited balance|Pool invariant violated/);
+    await p.db.wallet.update({where:{address:p.members[0].address},data:{balanceSnapshotSun:{increment:1}}});
+    strictEqual((await p.engine.extraRecoveryPreview()).eligible,true);
+    await p.engine.resumeExtraReserves();
+    strictEqual((await p.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'SETTLING');
+    strictEqual(await p.db.transfer.count({where:{kind:'PAYOUT'}}),2,'Reuse the saved End map');
+    for(let i=0;i<8;i++){
+      if((await p.db.engineState.findUniqueOrThrow({where:{id:1}})).phase==='COMPLETE')break;
+      const next=await p.db.transfer.findFirst({where:{kind:'PAYOUT',status:'PLANNED'},orderBy:{sequence:'asc'}});
+      if(next)await p.engine.approve(next.id);
+      await p.engine.tick();
+    }
+    strictEqual((await p.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'COMPLETE');
+    strictEqual(await p.db.transfer.count({where:{kind:'PAYOUT',status:'CONFIRMED',amountSun:p.TARGET}}),2);
   }finally{await p.db.$disconnect();await rm(p.directory,{recursive:true,force:true});}
 });

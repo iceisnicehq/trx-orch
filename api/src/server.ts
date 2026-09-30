@@ -86,6 +86,8 @@ app.get('/api/logs/:address',asyncRoute(async(req,res)=>{
 app.post('/api/admin/start',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.start())));
 app.post('/api/admin/replan',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.replan())));
 app.post('/api/admin/rebalance',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.rebalance())));
+app.post('/api/admin/resume',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.resumeExtraReserves())));
+// Keep the existing route for dashboards installed before this change.
 app.post('/api/admin/resume-excess',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.resumeExtraReserves())));
 app.post('/api/admin/mix-amounts',requirePassword,asyncRoute(async(req,res)=>{
   const body=z.object({mode:z.enum(['RANDOM','LIST']),amountsSun:z.array(z.union([z.literal(500_000),z.literal(1_000_000)])).min(1).max(64).optional()}).parse(req.body);
