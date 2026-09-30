@@ -33,3 +33,20 @@
 .amount-save{margin-top:12px;padding:8px 13px;border:1px solid #769b52;border-radius:6px;background:#243e31;color:#dcf8c8;font-size:12px;font-weight:800}
 .preview-details{border:1px solid #4c8277;background:#193931;border-radius:7px;padding:11px;color:#d7f8e7;font-size:12px;line-height:1.5}
 .preview-steps{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow:auto;margin-top:9px;color:#b4d8d1}
+.history-link{border:0;background:transparent;color:#9ddfd5;font-size:11px;font-weight:700;padding:2px 5px;margin-left:6px;text-decoration:underline;text-underline-offset:3px}
+.history-link:hover{color:#d7fff3}
+.history-dialog{width:min(780px,100%);max-height:min(90vh,940px);display:flex;flex-direction:column;border:1px solid #3b5765;background:#152537;border-radius:13px;box-shadow:0 24px 80px #0009;padding:23px}
+.history-dialog h2{margin:6px 0 0}
+.history-close{flex:none;width:32px;height:32px;border:1px solid #526c7d;background:#253849;color:#dfedf3;border-radius:6px;font-size:22px;line-height:1}
+.history-address{overflow-wrap:anywhere;color:#c5dae4;font:12px ui-monospace,monospace;margin:13px 0 5px}
+.history-intro{font-size:12px;line-height:1.5;color:#9bb3c0;margin:5px 0 14px}
+.history-records{min-height:80px;overflow-y:auto;padding-right:7px}
+.history-record{display:flex;flex-direction:column;gap:5px;padding:13px 2px;border-top:1px solid #29404e}
+.history-record-title{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:12px}
+.history-record>strong{font-size:13px;color:#e0f3ea}
+.history-record>small{font-size:11px;line-height:1.4;color:#8fa9b8;overflow-wrap:anywhere}
+.history-tx{font-family:ui-monospace,monospace}
+.history-actions{border-top:1px solid #29404e;display:flex;align-items:center;justify-content:flex-end;gap:10px;padding-top:15px;color:#9db5c4;font-size:11px}
+.history-actions button{border:1px solid #4c6a78;background:#233e4a;color:#d7eff0;border-radius:5px;padding:7px 10px;font-size:11px}
+.history-actions button:hover:not(:disabled),.history-close:hover{border-color:#b9f35a}
+@media(max-width:650px){.history-dialog{padding:16px}.history-actions{flex-wrap:wrap}.history-record>small{font-size:10px}}

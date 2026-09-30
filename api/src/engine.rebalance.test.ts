@@ -137,3 +137,58 @@ test('end during rebalance cancels its open map and creates a fresh payout map',
     await rm(directory,{recursive:true,force:true});
   }
 });
+
+test('LIST uses a funded high-bandwidth sender immediately and forecasts the soonest recovery otherwise',async()=>{
+  const directory=await mkdtemp(join(process.cwd(),'.list-readiness-test-'));
+  process.env.TRON_MODE='mock';
+  process.env.DATABASE_URL=`file:${join(directory,'pool.db')}`;
+  let db:PrismaClient|undefined;
+  try{
+    const migrations=['20260926000000_init','20260928000000_dynamic_members',
+      '20260929000000_bandwidth_receipts','20260929010000_bandwidth_block_time',
+      '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes'];
+    const sql=(await Promise.all(migrations.map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
+    execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
+    const [{loadConfig,TARGET},{TronService},{EngineService}]=await Promise.all([
+      import('./config.js'),import('./tron.js'),import('./engine.js')
+    ]);
+    const config=await loadConfig();
+    db=new PrismaClient();
+    const tron=new TronService(db,config),engine=new EngineService(db,tron,config);
+    await engine.init();
+    const members=config.wallets.slice(0,3);
+    for(const w of members){
+      await db.wallet.update({where:{address:w.address},data:{balanceSnapshotSun:TARGET}});
+      await engine.setMixEnabled(w.address,true);
+    }
+    await engine.start();
+    const free=new Map([[members[0].address,342],[members[1].address,600],[members[2].address,435]]);
+    tron.bandwidthSnapshot=async(address:string)=>({available:free.get(address)??600,limit:600,observedAt:Date.now()});
+    const startedAt=Date.now();
+    await engine.setMixAmounts('LIST',[TARGET]);
+    let next=await db.transfer.findFirstOrThrow({where:{kind:'MIX',status:'PLANNED'}});
+    strictEqual(next.from,members[1].address,'An enabled sender with 600 free Bandwidth goes before a sender with 342');
+    strictEqual(next.to,members[2].address,'Prefer a receiver able to continue the chain promptly');
+    strictEqual(next.scheduledAt.getTime()<startedAt+15_000,true,'A ready LIST sender has no artificial 1–2 hour gap');
+    await engine.approve(next.id);
+    strictEqual((await db.transfer.findUniqueOrThrow({where:{id:next.id}})).status,'SUBMITTED');
+    await engine.tick();
+    next=await db.transfer.findFirstOrThrow({where:{kind:'MIX',status:'PLANNED'}});
+    strictEqual(next.from,members[2].address,'The funded last recipient continues when it has enough Bandwidth');
+    strictEqual(next.scheduledAt.getTime()<Date.now()+15_000,true,'No global one-hour gap blocks the next LIST step');
+    free.set(members[2].address,390);
+    await engine.replan();
+    next=await db.transfer.findFirstOrThrow({where:{kind:'MIX',status:'PLANNED'}});
+    strictEqual(next.from,members[2].address,'With no ready sender, choose the soonest recovery');
+    strictEqual(next.scheduledAt.getTime()>Date.now()+60*60_000,true,'Below 400, keep the recovery forecast and hour buffer');
+    free.set(members[2].address,435);
+    await engine.replan();
+    next=await db.transfer.findFirstOrThrow({where:{kind:'MIX',status:'PLANNED'}});
+    await engine.approve(next.id);
+    strictEqual((await db.transfer.findUniqueOrThrow({where:{id:next.id}})).status,'SUBMITTED',
+      'A ready LIST transfer can broadcast after a recent MIX without the old global one-hour wait');
+  }finally{
+    await db?.$disconnect();
+    await rm(directory,{recursive:true,force:true});
+  }
+});

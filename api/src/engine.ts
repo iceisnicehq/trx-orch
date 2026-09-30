@@ -200,20 +200,47 @@ export class EngineService {
       await this.db.engineState.update({where:{id:1},data:{lastPlanAt:new Date(now),status:`List mode: waiting for a sender with ${(amount/TARGET).toFixed(1)} TRX of game balance`}});
       return;
     }
-    // Follow the confirmed receiver when possible. Never assume an unconfirmed
-    // incoming transfer: only one LIST step exists globally at a time.
-    const from=candidates.find(w=>w.address===lastReceiver)??candidates[randomInt(candidates.length)];
-    const peers=enabled.filter(w=>w.address!==from.address);
-    const to=peers[randomInt(peers.length)];
-    const candidateTime=now+randomInt(MIN_MIX_GAP_MS,MAX_MIX_GAP_MS+1);
-    const [observation,spends]=await Promise.all([this.tron.bandwidthSnapshot(from.address),this.tron.recentBandwidthSpends(from.address)]);
-    const ready=bufferedReadyAt(observation.limit,observation.available,observation.observedAt,candidateTime,MIN_FREE_BANDWIDTH,spends);
-    if(ready===null||ready>=now+PLAN_WINDOW_MS){
+    // A completed LIST transfer is the only input to the next choice. Check
+    // every enabled wallet once, including potential receivers, using live
+    // free-quota snapshots; dashboard snapshots may be up to two minutes old.
+    const snapshots=await Promise.all(enabled.map(w=>this.tron.bandwidthSnapshot(w.address)));
+    const resources=new Map(enabled.map((w,i)=>[w.address,snapshots[i]]));
+    const choose=(wallets:Wallet[],value:(w:Wallet)=>number,prefer?:string)=>{
+      const best=Math.max(...wallets.map(value));
+      const tied=wallets.filter(w=>value(w)===best);
+      return tied.find(w=>w.address===prefer)??tied[randomInt(tied.length)];
+    };
+    const readySenders=candidates.filter(w=>resources.get(w.address)!.available>=MIN_FREE_BANDWIDTH);
+    let from:Wallet|undefined,readyAt:number|undefined;
+    if(readySenders.length){
+      // Fresh accounts are useful before consuming more of a partially
+      // recovered account. The previous recipient retains priority on ties.
+      from=choose(readySenders,w=>resources.get(w.address)!.available,lastReceiver??undefined);
+      readyAt=now;
+    }else{
+      // No wallet can send now. Forecast only confirmed resource use and
+      // choose the earliest recoverable sender with the usual hour buffer.
+      const options=await Promise.all(candidates.map(async w=>({wallet:w,at:bufferedReadyAt(
+        resources.get(w.address)!.limit,resources.get(w.address)!.available,resources.get(w.address)!.observedAt,
+        now,MIN_FREE_BANDWIDTH,await this.tron.recentBandwidthSpends(w.address))})));
+      const eligible=options.filter((o):o is {wallet:Wallet;at:number}=>o.at!==null&&o.at<now+PLAN_WINDOW_MS);
+      if(eligible.length){
+        const soonest=Math.min(...eligible.map(o=>o.at));
+        const closest=eligible.filter(o=>o.at===soonest).map(o=>o.wallet);
+        from=choose(closest,w=>resources.get(w.address)!.available,lastReceiver??undefined);
+        readyAt=soonest;
+      }
+    }
+    if(!from||readyAt===undefined){
       await this.db.engineState.update({where:{id:1},data:{lastPlanAt:new Date(now),status:'List mode: waiting for free Bandwidth within the planning window'}});
       return;
     }
-    await this.insert([{kind:'MIX',status:'PLANNED',from:from.address,to:to.address,amountSun:amount,scheduledAt:new Date(ready)}],{
-      status:`List mode: next ${(amount/TARGET).toFixed(1)} TRX chain step queued; ${cursor+1} confirmed steps after completion`,
+    const nextAmount=amounts[(cursor+1)%amounts.length];
+    const peers=enabled.filter(w=>w.address!==from.address);
+    const fundedPeers=peers.filter(w=>b.find(x=>x.address===w.address)!.sun-(w.entryBalanceSun!-TARGET)+amount>=nextAmount);
+    const to=choose(fundedPeers.length?fundedPeers:peers,w=>resources.get(w.address)!.available);
+    await this.insert([{kind:'MIX',status:'PLANNED',from:from.address,to:to.address,amountSun:amount,scheduledAt:new Date(readyAt)}],{
+      status:`List mode: next ${(amount/TARGET).toFixed(1)} TRX step queued ${readyAt===now?'for immediate review':'after predicted bandwidth recovery'}; ${cursor+1} confirmed steps after completion`,
       lastPlanAt:new Date(now),event:'PLAN',detail:`LIST step ${(amount/TARGET).toFixed(1)} TRX ${from.address} → ${to.address}; next step waits for this receipt`
     });
   }
@@ -523,7 +550,7 @@ export class EngineService {
       }
       if(next.status==='PLANNED'){await this.db.engineState.update({where:{id:1},data:{status:`Awaiting approval: ${next.kind.toLowerCase()} #${next.sequence} from ${next.from}`}});return;}
       if(next.scheduledAt.getTime()>Date.now())return;
-      if(next.kind==='MIX'){
+      if(next.kind==='MIX'&&s.mixAmountMode==='RANDOM'){
         const last=await this.db.transfer.findFirst({where:{kind:'MIX',status:'CONFIRMED'},orderBy:{updatedAt:'desc'},select:{updatedAt:true}});
         if(last&&Date.now()-last.updatedAt.getTime()<MIN_MIX_GAP_MS){
           await this.db.engineState.update({where:{id:1},data:{status:`Waiting between mix transfers until ${new Date(last.updatedAt.getTime()+MIN_MIX_GAP_MS).toISOString()}`}});

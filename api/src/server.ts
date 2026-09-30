@@ -8,6 +8,7 @@ import {loadConfig,MODE,TARGET} from './config.js';
 import {TronService} from './tron.js';
 import {EngineService,HttpError} from './engine.js';
 import {TelegramService,telegramOptionsFromEnv} from './telegram.js';
+import {nodeHistory} from './node-history.js';
 
 const config=await loadConfig();
 const db=new PrismaClient();
@@ -61,6 +62,12 @@ app.get('/api/rebalance/preview',asyncRoute(async(_req,res)=>res.json(await engi
 app.get('/api/queue',asyncRoute(async(_req,res)=>{
   const rows=await db.transfer.findMany({where:{status:{in:['PLANNED','APPROVED','PAUSED','SUBMITTED','SUBMITTING','UNKNOWN']}},orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,note:true,txId:true}});
   res.json(rows);
+}));
+app.get('/api/history/:address',asyncRoute(async(req,res)=>{
+  const address=req.params.address;
+  if(!config.wallets.some(w=>w.address===address)&&address!==config.teacherAddress)throw new HttpError(404,'Unknown node');
+  const before=req.query.before===undefined?undefined:z.coerce.number().int().positive().safe().parse(req.query.before);
+  res.json(await nodeHistory(db,address,before));
 }));
 app.get('/api/logs/:address',asyncRoute(async(req,res)=>{
   const address=req.params.address;
