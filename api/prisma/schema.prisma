@@ -20,7 +20,7 @@ model Wallet {
 model Transfer {
   id         String @id @default(cuid())
   sequence   Int @unique
-  kind       String // MIX, REBALANCE, PAYOUT
+  kind       String // MIX, RETURN (attributed stakes), REBALANCE (legacy), PAYOUT
   status     String // PLANNED, APPROVED, SUBMITTING, SUBMITTED, CONFIRMED, CANCELLED, PAUSED, UNKNOWN
   from       String
   to         String
@@ -33,19 +33,27 @@ model Transfer {
   note       String?
   bandwidthUsed Int? // actual Bandwidth reported in the confirmed on-chain receipt
   confirmedAt DateTime? // block timestamp, not the later time receipt polling completed
+  approvalSource String? // MANUAL or AUTO; disabling Auto revokes only unsent AUTO approvals
+  campaignId String?
+  campaignDay Int?
+  plannedAt DateTime? // immutable original time; scheduledAt may move after resource checks
+  dependsOnId String?
+  allocations Allocation[]
+  campaign Campaign? @relation(fields:[campaignId],references:[id])
   sender     Wallet @relation("out",fields:[from],references:[address])
   @@index([status,sequence])
+  @@index([campaignId,sequence])
 }
 
 model EngineState {
   id              Int @id @default(1)
-  phase           String @default("IDLE") // IDLE, MIXING, REBALANCE_REQUESTED, REBALANCING, END_REQUESTED, SETTLING, COMPLETE, HALTED
-  status          String @default("Ready. Select at least two funded wallets, then Start.")
+  phase           String @default("IDLE") // CAMPAIGN, CAMPAIGN_RETURN_REQUESTED, CAMPAIGN_RETURNING, CAMPAIGN_RESTORED; legacy phases; SETTLING, COMPLETE, HALTED
+  status          String @default("Ready. Start to create a 24-hour plan.") // legacy DB default; init sets the current status explicitly
   teacherAddress  String
   teacherBaseline Int
   nextSequence    Int @default(1)
   lastPlanAt      DateTime?
-  mixAmountMode   String @default("RANDOM") // RANDOM or LIST
+  mixAmountMode   String @default("RANDOM") // SMART for campaigns; RANDOM/LIST retained for old records
   mixAmountList   String @default("[1000000,500000]") // exact Sun amounts, JSON
   mixAmountCursor Int @default(0) // advances only after a confirmed LIST transfer
   mixLastReceiver String? // next preferred sender for the LIST chain
@@ -53,7 +61,56 @@ model EngineState {
   settlementFromSequence Int? // first sequence in this end-game batch
   fatalReason     String?
   haltedFromPhase String? // durable pre-HALT phase; used only for guarded reserve recovery
+  activeCampaignId String?
+  teacherConfigAddress String? // bootstrap config address; DB overrides survive a read-only config mount
   updatedAt       DateTime @updatedAt
+}
+
+model Campaign {
+  id String @id @default(cuid())
+  seed String
+  version Int @default(1)
+  status String @default("ACTIVE") // ACTIVE, RETURN_REQUESTED, RETURNING, RESTORED, PAID
+  startedAt DateTime
+  deadlineAt DateTime
+  mixingDays Int
+  totalDays Int
+  returnReason String?
+  payAfterReturn Boolean @default(false)
+  createdAt DateTime @default(now())
+  members CampaignMember[]
+  transfers Transfer[]
+  positions OwnershipBalance[]
+}
+
+model CampaignMember {
+  campaignId String
+  address String
+  ordinal Int
+  profileJson String
+  campaign Campaign @relation(fields:[campaignId],references:[id])
+  @@id([campaignId,address])
+}
+
+// This records attribution, not identifiable coins on TRON. One native
+// transfer may carry contributions from several members.
+model Allocation {
+  transferId String
+  ownerAddress String
+  amountSun Int
+  transfer Transfer @relation(fields:[transferId],references:[id])
+  @@id([transferId,ownerAddress])
+  @@index([ownerAddress])
+}
+
+// Confirmed ownership only. Updated atomically with a zero-fee receipt.
+model OwnershipBalance {
+  campaignId String
+  ownerAddress String
+  holderAddress String
+  amountSun Int
+  campaign Campaign @relation(fields:[campaignId],references:[id])
+  @@id([campaignId,ownerAddress,holderAddress])
 }
 
 model Audit {

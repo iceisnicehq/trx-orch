@@ -123,6 +123,9 @@ export class TronService {
     if(MODE==='mock')return {txId:`mock-${Date.now()}-${Math.random().toString(36).slice(2)}`,signedJson:'{}',bytes:276};
     const unsigned=await this.rpc(()=>this.tron.transactionBuilder.sendTrx(to,amountSun,from));
     if(unsigned.raw_data.contract.length!==1||unsigned.raw_data.contract[0].type!=='TransferContract')throw Error('Unexpected contract type');
+    const value=unsigned.raw_data.contract[0].parameter.value;
+    if(TronWeb.address.fromHex(value.owner_address)!==from||TronWeb.address.fromHex(value.to_address)!==to||Number(value.amount)!==amountSun)
+      throw Error('Node returned a native transfer with a different sender, recipient or amount');
     const signed=await this.tron.trx.sign(unsigned,this.keys.get(from)!);
     if(!signed.signature?.length||signed.signature.length!==1)throw Error('Expected one signature');
     // TRON's documented estimation includes protobuf wrapper, signatures and result bytes.

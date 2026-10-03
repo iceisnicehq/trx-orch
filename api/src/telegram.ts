@@ -1,5 +1,6 @@
 import {createHash} from 'node:crypto';
 import type {Audit,PrismaClient,Transfer,Wallet} from '@prisma/client';
+import {approvalQueue} from './queue.js';
 
 export type TelegramOptions={botToken:string;channelId:string;pinnedMessageId:number;dashboardUrl?:string};
 const OPEN_STATUSES=['PLANNED','APPROVED','PAUSED','SUBMITTING','SUBMITTED','UNKNOWN'];
@@ -114,7 +115,7 @@ export class TelegramService {
   stop(){if(this.timer)clearInterval(this.timer);}
   private async names(){
     if(!this.wallets)this.wallets=await this.db.wallet.findMany({orderBy:{ordinal:'asc'},select:{address:true,ordinal:true}});
-    if(!this.teacherAddress)this.teacherAddress=(await this.db.engineState.findUniqueOrThrow({where:{id:1},select:{teacherAddress:true}})).teacherAddress;
+    this.teacherAddress=(await this.db.engineState.findUniqueOrThrow({where:{id:1},select:{teacherAddress:true}})).teacherAddress;
     return {wallets:this.wallets,teacherAddress:this.teacherAddress};
   }
   private async api(method:'editMessageText'|'sendMessage',body:Record<string,unknown>):Promise<TelegramResponse>{
@@ -155,7 +156,7 @@ export class TelegramService {
       this.db.transfer.findMany({where:{status:{in:OPEN_STATUSES}},orderBy:{sequence:'asc'}}),
       this.names()
     ]);
-    const rendered=renderQueue(state.phase,rows,wallets,teacherAddress,dashboardUrl);
+    const rendered=renderQueue(state.phase,approvalQueue(rows),wallets,teacherAddress,dashboardUrl);
     const hash=createHash('sha256').update(rendered).digest('hex');
     if(hash===cursor.lastQueueHash||(cursor.nextQueueAttemptAt&&cursor.nextQueueAttemptAt.getTime()>Date.now()))return;
     try{

@@ -16,7 +16,7 @@ test('node transfer history pages through every record without losing rows when 
       '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes',
       '20260930000000_external_extra_reserves'];
     const sql=(await Promise.all(migrations.map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
-    execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
+    execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql+'\n'+await readFile('prisma/migrations/20261004000000_campaign_ownership/migration.sql','utf8')]);
     db=new PrismaClient();
     const a='sender',b='recipient',other='other';
     await db.wallet.createMany({data:[{address:a,ordinal:0},{address:b,ordinal:1},{address:other,ordinal:2}]});

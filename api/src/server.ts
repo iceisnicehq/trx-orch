@@ -9,11 +9,13 @@ import {TronService} from './tron.js';
 import {EngineService,HttpError} from './engine.js';
 import {TelegramService,telegramOptionsFromEnv} from './telegram.js';
 import {nodeHistory} from './node-history.js';
+import {campaignSummary,ownerReport,reportCsv} from './campaign-report.js';
+import {approvalQueue} from './queue.js';
 
 const config=await loadConfig();
 const db=new PrismaClient();
 const tron=new TronService(db,config);
-const engine=new EngineService(db,tron,config);
+const engine=new EngineService(db,tron,config,true);
 const telegram=new TelegramService(db,telegramOptionsFromEnv());
 await telegram.bootstrap();
 await engine.init();
@@ -31,6 +33,9 @@ function requirePassword(req:express.Request,res:express.Response,next:express.N
   next();
 }
 const asyncRoute=(fn:(req:express.Request,res:express.Response)=>Promise<unknown>)=>(req:express.Request,res:express.Response,next:express.NextFunction)=>{Promise.resolve(fn(req,res)).catch(next);};
+async function knownNode(address:string){
+  return config.wallets.some(w=>w.address===address)||address===config.teacherAddress||Boolean(await db.transfer.findFirst({where:{kind:'PAYOUT',to:address,status:'CONFIRMED'},select:{id:true}}));
+}
 app.get('/api/health',(_req,res)=>res.json({ok:true,mode:MODE}));
 app.get('/api/state',asyncRoute(async(_req,res)=>{
   const [s,wallets,paid]=await Promise.all([db.engineState.findUniqueOrThrow({where:{id:1}}),db.wallet.findMany({orderBy:{ordinal:'asc'}}),db.transfer.aggregate({where:{kind:'PAYOUT',status:'CONFIRMED'},_sum:{amountSun:true}})]);
@@ -41,39 +46,56 @@ app.get('/api/state',asyncRoute(async(_req,res)=>{
   const reserveSun=members.reduce((n,w)=>n+w.reserveSun,0);
   const rebalanceRows=s.rebalanceFromSequence===null?[]:await db.transfer.findMany({
     where:{kind:'REBALANCE',sequence:{gte:s.rebalanceFromSequence}},select:{status:true}});
-  res.json({mode:MODE,phase:s.phase,status:`Status: ${s.status}`,fatalReason:s.fatalReason,teacherAddress:config.teacherAddress,
+  res.json({mode:MODE,phase:s.phase,status:`Status: ${s.status}`,fatalReason:s.fatalReason,teacherAddress:s.teacherAddress,
     expectedPoolSun:members.length*TARGET-(paid._sum.amountSun??0),poolSun:members.reduce((n,w)=>n+w.balanceSun,0)-reserveSun,
     reserveSun,configuredSun:balances.reduce((n,w)=>n+w.balanceSun,0),selectedCount:balances.filter(w=>w.mixEnabled).length,joinedCount:balances.filter(w=>w.joined).length,
-    mixAmountMode:s.mixAmountMode,mixAmountListSun:JSON.parse(s.mixAmountList),mixAmountCursor:s.mixAmountCursor,
+    mixAmountMode:s.mixAmountMode,mixAmountListSun:JSON.parse(s.mixAmountList),mixAmountCursor:s.mixAmountCursor,activeCampaignId:s.activeCampaignId,
     rebalanceTotal:rebalanceRows.length,rebalanceDone:rebalanceRows.filter(r=>r.status==='CONFIRMED').length,
     wallets:balances,updatedAt:s.updatedAt});
 }));
 app.get('/api/graph',asyncRoute(async(_req,res)=>{
   const [transfers,wallets,s]=await Promise.all([
-    db.transfer.findMany({orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,createdAt:true,txId:true,note:true,bandwidthUsed:true}}),
+    db.transfer.findMany({orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,createdAt:true,txId:true,note:true,bandwidthUsed:true,campaignId:true,campaignDay:true}}),
     db.wallet.findMany({orderBy:{ordinal:'asc'}}),db.engineState.findUniqueOrThrow({where:{id:1}})
   ]);
-  res.json({nodes:[...wallets.map(w=>({id:w.address,label:`Node ${w.ordinal+1}`,mixEnabled:w.mixEnabled,joined:w.joined})),{id:config.teacherAddress,label:'Teacher',mixEnabled:false,joined:false}],
-    currentMapFromSequence:['REBALANCE_REQUESTED','REBALANCING'].includes(s.phase)?s.rebalanceFromSequence:
+  const oldTeachers=[...new Set(transfers.filter(t=>t.kind==='PAYOUT'&&t.to!==s.teacherAddress).map(t=>t.to))];
+  const returning=transfers.find(t=>t.campaignId===s.activeCampaignId&&t.kind==='RETURN'&&t.status!=='CANCELLED');
+  res.json({nodes:[...wallets.map(w=>({id:w.address,label:`Node ${w.ordinal+1}`,mixEnabled:w.mixEnabled,joined:w.joined})),{id:s.teacherAddress,label:'Teacher',mixEnabled:false,joined:false},
+      ...oldTeachers.map(id=>({id,label:'Teacher (previous)',mixEnabled:false,joined:false}))],
+    currentMapFromSequence:s.phase.startsWith('CAMPAIGN_RETURN')?returning?.sequence??null:['REBALANCE_REQUESTED','REBALANCING'].includes(s.phase)?s.rebalanceFromSequence:
       ['END_REQUESTED','SETTLING'].includes(s.phase)?s.settlementFromSequence:null,
     edges:transfers.filter(t=>t.status!=='CANCELLED')});
 }));
 app.get('/api/rebalance/preview',asyncRoute(async(_req,res)=>res.json(await engine.rebalancePreview())));
 app.get('/api/recovery/preview',asyncRoute(async(_req,res)=>res.json(await engine.extraRecoveryPreview())));
 app.get('/api/queue',asyncRoute(async(_req,res)=>{
-  const rows=await db.transfer.findMany({where:{status:{in:['PLANNED','APPROVED','PAUSED','SUBMITTED','SUBMITTING','UNKNOWN']}},orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,note:true,txId:true}});
-  res.json(rows);
+  const rows=await db.transfer.findMany({where:{status:{in:['PLANNED','APPROVED','PAUSED','SUBMITTED','SUBMITTING','UNKNOWN']}},orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,note:true,txId:true,campaignId:true,campaignDay:true}});
+  res.json(approvalQueue(rows));
+}));
+app.get('/api/campaign',asyncRoute(async(_req,res)=>res.json(await campaignSummary(db))));
+app.get('/api/campaigns',asyncRoute(async(_req,res)=>res.json(await db.campaign.findMany({orderBy:{createdAt:'desc'},select:{id:true,status:true,startedAt:true,deadlineAt:true,totalDays:true}}))));
+app.get('/api/campaign/return/preview',asyncRoute(async(_req,res)=>res.json(await engine.campaignReturnPreview())));
+app.get('/api/campaign/report/:address',asyncRoute(async(req,res)=>{
+  const id=req.query.campaignId===undefined?undefined:z.string().min(1).max(100).parse(req.query.campaignId);
+  const report=await ownerReport(db,req.params.address,id);
+  if(!report)throw new HttpError(404,'This wallet has no attributed stake in the selected campaign');
+  if(req.query.format==='csv'){
+    res.setHeader('Content-Type','text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition',`attachment; filename="node-${report.campaign.members.find(m=>m.address===report.address)!.ordinal+1}-${report.campaign.id}.csv"`);
+    res.send(reportCsv(report));return;
+  }
+  res.json(report);
 }));
 app.get('/api/history/:address',asyncRoute(async(req,res)=>{
   const address=req.params.address;
-  if(!config.wallets.some(w=>w.address===address)&&address!==config.teacherAddress)throw new HttpError(404,'Unknown node');
+  if(!await knownNode(address))throw new HttpError(404,'Unknown node');
   const before=req.query.before===undefined?undefined:z.coerce.number().int().positive().safe().parse(req.query.before);
   const status=z.enum(['ALL','CONFIRMED']).parse(req.query.status??'ALL');
   res.json(await nodeHistory(db,address,before,status));
 }));
 app.get('/api/logs/:address',asyncRoute(async(req,res)=>{
   const address=req.params.address;
-  if(address!=='all'&&!config.wallets.some(w=>w.address===address)&&address!==config.teacherAddress)throw new HttpError(404,'Unknown node');
+  if(address!=='all'&&!await knownNode(address))throw new HttpError(404,'Unknown node');
   const page=z.coerce.number().int().min(0).max(100000).parse(req.query.page??0);
   const status=z.enum(['ALL','CONFIRMED']).parse(req.query.status??'ALL');
   const [events,transfers]=await Promise.all([
@@ -83,15 +105,21 @@ app.get('/api/logs/:address',asyncRoute(async(req,res)=>{
   ]);
   res.json({events,transfers});
 }));
-app.post('/api/admin/start',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.start())));
+app.post('/api/admin/start',requirePassword,asyncRoute(async(req,res)=>{
+  const body=z.object({totalDays:z.number().int().min(18).max(60).optional(),deadlineAt:z.string().datetime({offset:true}).optional()}).parse(req.body);
+  res.json(await engine.startCampaign({totalDays:body.totalDays,deadlineAt:body.deadlineAt?new Date(body.deadlineAt):undefined}));
+}));
+app.post('/api/admin/teacher',requirePassword,asyncRoute(async(req,res)=>{
+  res.json(await engine.changeTeacher(z.string().trim().parse(req.body.address)));
+}));
+app.post('/api/admin/campaign/return',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.returnCampaign())));
 app.post('/api/admin/replan',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.replan())));
 app.post('/api/admin/rebalance',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.rebalance())));
 app.post('/api/admin/resume',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.resumeExtraReserves())));
 // Keep the existing route for dashboards installed before this change.
 app.post('/api/admin/resume-excess',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.resumeExtraReserves())));
 app.post('/api/admin/mix-amounts',requirePassword,asyncRoute(async(req,res)=>{
-  const body=z.object({mode:z.enum(['RANDOM','LIST']),amountsSun:z.array(z.union([z.literal(500_000),z.literal(1_000_000)])).min(1).max(64).optional()}).parse(req.body);
-  res.json(await engine.setMixAmounts(body.mode,body.amountsSun));
+  throw new HttpError(410,'RANDOM/LIST are retired. Restore the old pool and Start the complete smart campaign.');
 }));
 app.post('/api/admin/end',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.end())));
 app.post('/api/admin/queue/:id/approve',requirePassword,asyncRoute(async(req,res)=>res.json(await engine.approve(req.params.id))));

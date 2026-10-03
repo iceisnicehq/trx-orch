@@ -67,3 +67,29 @@
 .chain-steps strong span{color:#b9f35a}
 .history-dialog .transfer-chain{flex:none}
 @media(max-width:650px){.chain-steps li{flex-basis:165px}.history-dialog .transfer-chain{padding-top:10px}}
+.campaign-inputs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}
+.campaign-inputs label,.teacher-setting label{display:block;color:#a1b9c5;font-size:11px;line-height:1.5}
+.campaign-inputs input,.teacher-setting input{display:block;width:100%;min-width:0;margin-top:6px}
+.teacher-setting{border-top:1px solid #293e4d;padding:17px 0;margin-top:18px}
+.full-address{overflow-wrap:anywhere;font:11px ui-monospace,monospace;color:#adcbd8;line-height:1.65}
+.campaign-progress{display:flex;flex-direction:column;gap:7px;border:1px solid #37676b;border-radius:8px;background:#143138;padding:12px;font-size:12px}
+.campaign-progress small{color:#a2c3c6;line-height:1.5}.campaign-warning{color:#ffdca4!important;font-size:12px;line-height:1.5}
+.wallet-ownership{color:#a6dacb!important;line-height:1.5!important;max-width:340px}
+.history-dialog{width:min(1140px,100%);max-height:94vh}
+.stake-report{overflow:auto;min-height:100px;padding-right:5px}
+.report-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:8px 0}
+.report-download{display:inline-block;text-decoration:none;color:#d2f7c0;background:#234336;border:1px solid #73a775;border-radius:6px;padding:9px 12px;font-size:12px;font-weight:700}
+.report-facts{display:flex;gap:10px;flex-wrap:wrap;color:#b8dccd;font-size:12px;margin:14px 0}
+.report-facts span{border:1px solid #35585c;border-radius:6px;padding:8px;background:#18353b}
+.owner-positions{display:flex;flex-wrap:wrap;gap:9px;color:#a9d5d3;font-size:12px;margin:12px 0}
+.owner-positions>b{flex-basis:100%}.owner-positions>span{background:#19323e;border:1px solid #365b66;padding:9px;border-radius:6px}
+.owner-positions small{display:block;overflow-wrap:anywhere;color:#739aaa;font:10px ui-monospace,monospace;max-width:290px;margin-top:5px}
+.report-day{display:flex;flex-wrap:wrap;gap:12px;align-items:center;color:#9bbcc5;font-size:12px;margin:14px 0}
+.report-day input{flex:1;min-width:120px;accent-color:#b9f35a;padding:0}
+.ownership-canvas{height:480px;width:100%;border:1px solid #335461;border-radius:9px;background:#0e2030;touch-action:none;margin:10px 0}
+.ownership-flow>small{display:block;color:#86a9b4;font-size:11px;line-height:1.5}
+.report-table{max-height:400px}.report-table tbody tr{cursor:pointer}.report-table tbody tr.selected{background:#214449}.report-table tbody tr:hover{background:#1b3645}
+.report-detail{padding:13px;border:1px solid #437476;border-radius:8px;background:#17333a;color:#b9dbd8;font-size:12px;margin:14px 0;line-height:1.6}
+.report-detail small{display:block;color:#86adb5;line-height:1.5}
+.history-overlay{z-index:6}.overlay:not(.history-overlay){z-index:8}
+@media(max-width:650px){.campaign-inputs{grid-template-columns:1fr}.ownership-canvas{height:380px}.history-dialog{max-height:96vh}.owner-positions>span{max-width:100%}}

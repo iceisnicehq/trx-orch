@@ -1,9 +1,13 @@
-import {randomInt} from 'node:crypto';
+import {randomInt,randomBytes,randomUUID} from 'node:crypto';
+import {TronWeb} from 'tronweb';
 import type {EngineState,PrismaClient,Transfer,Wallet} from '@prisma/client';
 import {MODE,TARGET,type Config} from './config.js';
 import {settleTargets,settlementPlan} from './settlement.js';
 import {BandwidthWait,TronService} from './tron.js';
 import {bufferedReadyAt,MIN_FREE_BANDWIDTH} from './recovery.js';
+import {buildCampaignPlan,DAY,type CampaignPlan} from './campaign-plan.js';
+import {applyConfirmedOwnership,verifyOwnership,attributedReturns,OwnershipError} from './ownership.js';
+import {ownershipFlow,shapeSignature} from './campaign-report.js';
 
 export class HttpError extends Error {constructor(public code:number,message:string){super(message);}}
 const MIN_MIX_GAP_MS=60*60_000;
@@ -11,11 +15,12 @@ const MAX_MIX_GAP_MS=2*60*60_000;
 const PLAN_WINDOW_MS=24*60*60_000;
 const PLAN_RETRY_MS=30*60_000;
 const OPEN_MIX=['PLANNED','APPROVED','PAUSED','SUBMITTING','SUBMITTED','UNKNOWN'];
+const CAMPAIGN_PHASES=['CAMPAIGN','CAMPAIGN_RETURN_REQUESTED','CAMPAIGN_RETURNING','CAMPAIGN_RESTORED'];
 const VALID_LIST_AMOUNTS=new Set([500_000,1_000_000]);
 type PoolBalance={address:string;sun:number};
 type ExtraReserve={address:string;sun:number};
 type PoolReview={ok:true;balances:PoolBalance[];extras:ExtraReserve[];total:number;expected:number}|{ok:false;reason:string};
-const RESUMABLE_PHASES=['MIXING','REBALANCE_REQUESTED','REBALANCING','END_REQUESTED','SETTLING'];
+const RESUMABLE_PHASES=['MIXING','LEGACY_PAUSED','REBALANCE_REQUESTED','REBALANCING','END_REQUESTED','SETTLING',...CAMPAIGN_PHASES];
 function amountList(json:string):number[]{
   const parsed:unknown=JSON.parse(json);
   if(!Array.isArray(parsed)||parsed.length<1||parsed.length>64||!parsed.every(x=>typeof x==='number'&&VALID_LIST_AMOUNTS.has(x)))throw Error('Invalid persisted mix amount list');
@@ -24,7 +29,8 @@ function amountList(json:string):number[]{
 export class EngineService {
   private busy=false;
   private timer?:NodeJS.Timeout;
-  constructor(private db:PrismaClient, private tron:TronService, private config:Config){}
+  constructor(private db:PrismaClient, private tron:TronService, private config:Config,private campaignOnly=false){}
+  stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
   private async audit(event:string,detail:string,transferId?:string){await this.db.audit.create({data:{event,detail,transferId}});}
   async withLock<T>(fn:()=>Promise<T>):Promise<T>{
     if(this.busy)throw new HttpError(409,'Engine is busy; retry shortly');
@@ -39,7 +45,11 @@ export class EngineService {
     if(wallets.length){
       if(wallets.length!==this.config.wallets.length||wallets.some((w,i)=>w.address!==this.config.wallets[i].address))throw Error('Wallet config differs from persisted pool; refusing to start');
       const state=await this.state();
-      if(state.teacherAddress!==this.config.teacherAddress)throw Error('Teacher address changed; refusing to start');
+      const bootstrap=state.teacherConfigAddress??state.teacherAddress;
+      if(this.config.teacherAddress!==state.teacherAddress&&this.config.teacherAddress!==bootstrap)
+        throw Error('Teacher config differs from both the bootstrap and the protected DB setting; use the saved config or the admin Change teacher action');
+      await this.db.engineState.update({where:{id:1},data:{teacherConfigAddress:this.config.teacherAddress}});
+      this.config.teacherAddress=state.teacherAddress;
       // Preserve an already running 17-wallet game when upgrading its database.
       // An idle game has no committed pool and starts with no joined wallets.
       if(!wallets.some(w=>w.joined) && ['MIXING','END_REQUESTED','SETTLING','COMPLETE'].includes(state.phase)){
@@ -51,13 +61,23 @@ export class EngineService {
         for(let i=0;i<this.config.wallets.length;i++)await tx.wallet.create({data:{address:this.config.wallets[i].address,ordinal:i}});
         // Retain the legacy column for existing databases; a third-party
         // recipient's unrelated balance cannot verify our individual payouts.
-        await tx.engineState.create({data:{id:1,teacherAddress:this.config.teacherAddress,teacherBaseline:0,status:'Ready. Select at least two funded wallets, then Start.'}});
+        await tx.engineState.create({data:{id:1,teacherAddress:this.config.teacherAddress,teacherConfigAddress:this.config.teacherAddress,teacherBaseline:0,status:'Ready. Select at least two funded wallets, then Start.'}});
         await tx.audit.create({data:{event:'INITIALIZED',detail:`${this.config.wallets.length} wallets configured; mode ${MODE}`}});
       },{timeout:30_000});
     }
-    const s=await this.state();
+    let s=await this.state();
+    if(this.campaignOnly&&s.phase==='MIXING'){
+      await this.db.$transaction(async tx=>{
+        await tx.transfer.updateMany({where:{kind:'MIX',campaignId:null,status:{in:['PLANNED','APPROVED','PAUSED']}},
+          data:{status:'CANCELLED',note:'Upgrade paused the old amount modes; campaign requires a balanced baseline'}});
+        await tx.engineState.update({where:{id:1},data:{phase:'LEGACY_PAUSED',lastPlanAt:null,
+          status:'Old mixer paused for upgrade. Rebalance if necessary, select participants and start the complete smart plan.'}});
+        await tx.audit.create({data:{event:'LEGACY_PAUSED',detail:'RANDOM/LIST stopped on upgrade; unsent approvals revoked; submitted transfers and all history retained'}});
+      });
+      s=await this.state();
+    }
     if(s.phase==='MIXING')await this.trimLegacyMixQueue();
-    if(['MIXING','REBALANCE_REQUESTED','REBALANCING','END_REQUESTED','SETTLING'].includes(s.phase))await this.withLock(()=>this.tickBody());
+    if(['MIXING','LEGACY_PAUSED','REBALANCE_REQUESTED','REBALANCING','END_REQUESTED','SETTLING',...CAMPAIGN_PHASES].includes(s.phase))await this.withLock(()=>this.tickBody());
     this.timer=setInterval(()=>{
       if(this.busy)return;
       this.tick().catch(e=>console.error('Tick:',e.message));
@@ -193,9 +213,130 @@ export class EngineService {
     const recovery=await this.recoveryReview();
     if(!recovery.eligible||!recovery.review||!recovery.phase)throw new HttpError(409,recovery.reason??'Extra reserve recovery is unavailable');
     await this.confirmExtraSnapshot(recovery.review);
-    await this.saveExtraReserves(recovery.extras,recovery.phase,recovery.haltReason??undefined);
+    const phase=this.campaignOnly&&recovery.phase==='MIXING'?'LEGACY_PAUSED':recovery.phase;
+    await this.saveExtraReserves(recovery.extras,phase,recovery.haltReason??undefined);
+    if(phase==='LEGACY_PAUSED')await this.db.transfer.updateMany({where:{kind:'MIX',status:{in:['PLANNED','APPROVED','PAUSED']}},data:{status:'CANCELLED',note:'Legacy mixer paused after guarded recovery'}});
     await this.tickBody();
-    return {ok:true,phase:recovery.phase,reservedSun:recovery.totalExtraSun};
+    return {ok:true,phase,reservedSun:recovery.totalExtraSun};
+  });}
+  async changeTeacher(address:string){return this.withLock(async()=>{
+    if(!TronWeb.isAddress(address)||!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address))throw new HttpError(400,'Enter the full Base58Check TRON address');
+    if(this.config.wallets.some(w=>w.address===address))throw new HttpError(400,'Teacher cannot be a participant wallet');
+    const s=await this.state();
+    if(address===s.teacherAddress)return {ok:true,teacherAddress:address};
+    const [inFlight,unfinishedPayout]=await Promise.all([
+      this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}}),
+      this.db.transfer.findFirst({where:{kind:'PAYOUT',status:{notIn:['CONFIRMED','CANCELLED']}}})
+    ]);
+    const c=s.activeCampaignId?await this.db.campaign.findUnique({where:{id:s.activeCampaignId}}):null;
+    if(inFlight||unfinishedPayout||['END_REQUESTED','SETTLING'].includes(s.phase)||c?.payAfterReturn)
+      throw new HttpError(409,'Resolve in-flight transfers and finish or investigate the existing payout batch before changing the teacher');
+    if(!await this.tron.active(address))throw new HttpError(409,'Teacher account must already be activated to avoid activation fees');
+    await this.db.$transaction(async tx=>{
+      await tx.engineState.update({where:{id:1},data:{teacherAddress:address}});
+      await tx.audit.create({data:{event:'TEACHER_CHANGED',detail:`Admin changed teacher from ${s.teacherAddress} to ${address}; confirmed history retained; DB setting overrides the bootstrap config`}});
+    });
+    this.config.teacherAddress=address;
+    return {ok:true,teacherAddress:address};
+  });}
+
+  async startCampaign(options:{totalDays?:number;deadlineAt?:Date}={}){return this.withLock(async()=>{
+    const s=await this.state();
+    if(!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED'].includes(s.phase))throw new HttpError(409,`Cannot create a new campaign in ${s.phase}`);
+    if(await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}}))
+      throw new HttpError(409,'Wait for the submitted transaction to confirm before creating a campaign');
+    if(await this.db.transfer.count({where:{kind:'PAYOUT',status:'CONFIRMED'}}))
+      throw new HttpError(409,'This pool has already paid stakes; it cannot be reused for a new campaign');
+    const previouslyJoined=await this.joined();
+    if(previouslyJoined.length){
+      const balances=await this.reconcile();if(!balances)throw new HttpError(409,'Pool verification failed');
+      const current=await this.joined();
+      if(balances.some(w=>w.sun!==current.find(j=>j.address===w.address)!.entryBalanceSun!))
+        throw new HttpError(409,'Rebalance the old game first: every joined wallet must hold exactly 1 TRX plus its protected extra Sun');
+    }
+    const selected=await this.db.wallet.findMany({where:{mixEnabled:true},orderBy:{ordinal:'asc'}});
+    if(selected.length<2)throw new HttpError(409,'Select at least two funded wallets');
+    const balances=await this.balances(selected);
+    for(const w of selected){
+      if(!await this.tron.active(w.address))throw new HttpError(409,`Node ${w.ordinal+1} is not activated`);
+      const balance=balances.find(b=>b.address===w.address)!.sun;
+      if(balance<TARGET||w.joined&&balance!==w.entryBalanceSun)
+        throw new HttpError(409,`Node ${w.ordinal+1} must hold 1 TRX plus its recorded personal reserve`);
+    }
+    const startedAt=new Date(Date.now()+2*60_000),totalDays=options.totalDays??36;
+    const deadlineAt=options.deadlineAt??new Date(startedAt.getTime()+(totalDays+6)*DAY);
+    if(!Number.isInteger(totalDays)||totalDays<18||totalDays>60||!Number.isFinite(deadlineAt.getTime()))throw new HttpError(400,'Choose 18–60 campaign days and a valid deadline');
+    const baseSeed=randomBytes(16).toString('hex');
+    let plan:CampaignPlan|undefined;
+    for(let attempt=0;attempt<32;attempt++){
+      const candidate=buildCampaignPlan(selected,`${baseSeed}:${attempt}`,startedAt,totalDays);
+      const rows=candidate.steps.map((step,i)=>({...step,id:String(i),sequence:i+1,status:'PLANNED',campaignDay:step.day}));
+      const shapes=selected.map(w=>shapeSignature(ownershipFlow(w.address,rows)));
+      if(new Set(shapes).size===selected.length){plan=candidate;break;}
+    }
+    if(!plan)throw new HttpError(409,'Could not generate distinct report structures; retry without sending any transactions');
+    if(Math.max(...plan.steps.map(t=>t.plannedAt.getTime()))>deadlineAt.getTime()-4*DAY)
+      throw new HttpError(400,'The complete plan must leave at least four days before the deadline for payouts and reports');
+    const id=randomUUID(),stepIds=plan.steps.map(()=>randomUUID());
+    const chosen=plan;
+    await this.db.$transaction(async tx=>{
+      await tx.transfer.updateMany({where:{kind:'MIX',status:{in:['PLANNED','APPROVED','PAUSED']}},
+        data:{status:'CANCELLED',note:'Superseded by the attributed campaign; old approvals revoked'}});
+      for(const w of selected)if(!w.joined){
+        const balance=balances.find(b=>b.address===w.address)!.sun;
+        await tx.wallet.update({where:{address:w.address},data:{joined:true,entryBalanceSun:balance}});
+        await tx.audit.create({data:{event:'JOIN',detail:`${w.address} joined with 1 TRX; ${balance-TARGET} extra Sun reserved`}});
+      }
+      await tx.campaign.create({data:{id,seed:chosen.seed,startedAt,deadlineAt,totalDays,mixingDays:chosen.mixingDays}});
+      await tx.campaignMember.createMany({data:selected.map((w,i)=>({campaignId:id,address:w.address,ordinal:w.ordinal,profileJson:JSON.stringify(chosen.profiles[i])}))});
+      await tx.ownershipBalance.createMany({data:selected.map(w=>({campaignId:id,ownerAddress:w.address,holderAddress:w.address,amountSun:TARGET}))});
+      await tx.transfer.createMany({data:chosen.steps.map((step,i)=>({id:stepIds[i],sequence:s.nextSequence+i,kind:step.kind,
+        status:selected.find(w=>w.address===step.from)!.autoApprove?'APPROVED':'PLANNED',
+        approvalSource:selected.find(w=>w.address===step.from)!.autoApprove?'AUTO':null,
+        from:step.from,to:step.to,amountSun:step.amountSun,scheduledAt:step.plannedAt,plannedAt:step.plannedAt,
+        campaignId:id,campaignDay:step.day,dependsOnId:step.dependsIndex===null?null:stepIds[step.dependsIndex]}))});
+      await tx.allocation.createMany({data:chosen.steps.flatMap((step,i)=>step.allocations.map(a=>({...a,transferId:stepIds[i]})))});
+      await tx.engineState.update({where:{id:1},data:{phase:'CAMPAIGN',activeCampaignId:id,nextSequence:s.nextSequence+chosen.steps.length,
+        mixAmountMode:'SMART',lastPlanAt:null,fatalReason:null,haltedFromPhase:null,
+        status:`Campaign planned: ${chosen.steps.length} transfers; ${chosen.mixingDays} equal mixing sends per wallet; manual approval unless Auto is enabled`}});
+      await tx.audit.create({data:{event:'CAMPAIGN_PLANNED',detail:`Campaign ${id}; ${selected.length} members; ${chosen.mixingDays} mixing rounds; staggered split profiles; ${chosen.steps.length} native transfers; deadline ${deadlineAt.toISOString()}; old unsent approvals cancelled`}});
+    },{timeout:60_000});
+    this.tron.invalidatePublicSnapshot();
+    return {ok:true,campaignId:id,totalTransfers:chosen.steps.length};
+  });}
+
+  private async requestCampaignReturn(reason:string,payAfterReturn=false){
+    const s=await this.state();if(!s.activeCampaignId)throw new HttpError(409,'No attributed campaign');
+    if(!CAMPAIGN_PHASES.includes(s.phase))throw new HttpError(409,`Cannot return campaign funds in ${s.phase}`);
+    const campaign=await this.db.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId}});
+    if(campaign.payAfterReturn&&!payAfterReturn)
+      throw new HttpError(409,'End Game was already explicitly requested; the existing payout batch must be resolved first');
+    // Retried Rebalance requests must reuse the saved closing map and its
+    // approvals. End is the only action allowed to upgrade it to payouts.
+    if(!payAfterReturn&&(s.phase==='CAMPAIGN_RESTORED'||
+      ['CAMPAIGN_RETURN_REQUESTED','CAMPAIGN_RETURNING'].includes(s.phase)&&
+      campaign.returnReason!=='Scheduled complete-plan return'))return;
+    if(await this.db.transfer.findFirst({where:{status:'UNKNOWN'}}))throw new HttpError(409,'Investigate the uncertain transaction before changing the closing map');
+    await this.db.$transaction(async tx=>{
+      await tx.transfer.updateMany({where:{campaignId:s.activeCampaignId,kind:{in:['MIX','RETURN']},status:{in:['PLANNED','APPROVED','PAUSED']}},
+        data:{status:'CANCELLED',note:`Campaign closing requested: ${reason}; unsent approval revoked`}});
+      await tx.campaign.update({where:{id:s.activeCampaignId!},data:{status:'RETURN_REQUESTED',returnReason:reason,payAfterReturn}});
+      await tx.engineState.update({where:{id:1},data:{phase:'CAMPAIGN_RETURN_REQUESTED',status:'Closing requested; confirming any submitted transfer before returning attributed shares'}});
+      await tx.audit.create({data:{event:'CAMPAIGN_RETURN_REQUESTED',detail:`${reason}; teacher payouts ${payAfterReturn?'requested after restoration':'not requested'}; original confirmed history preserved`}});
+    });
+  }
+  async returnCampaign(){return this.withLock(async()=>{
+    await this.requestCampaignReturn('Admin requested early return to original owners');
+    await this.tickBody();return {ok:true};
+  });}
+  async campaignReturnPreview(){return this.withLock(async()=>{
+    const s=await this.state();if(!s.activeCampaignId)throw new HttpError(409,'No attributed campaign');
+    const pending=await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}});
+    if(pending)return {pendingReceipt:true,transferCount:null,steps:[],estimatedDays:null};
+    const positions=await verifyOwnership(this.db,s.activeCampaignId);
+    const steps=attributedReturns(positions),counts=new Map<string,number>();
+    for(const step of steps)counts.set(step.from,(counts.get(step.from)??0)+1);
+    return {pendingReceipt:false,transferCount:steps.length,steps,estimatedDays:Math.max(0,...counts.values())};
   });}
   async start(){return this.withLock(async()=>{
     const s=await this.state();
@@ -325,14 +466,16 @@ export class EngineService {
       lastPlanAt:new Date(now),event:'PLAN',detail:`LIST step ${(amount/TARGET).toFixed(1)} TRX ${from.address} → ${to.address}; next step waits for this receipt`
     });
   }
-  private async insert(rows:{kind:string;status:string;from:string;to:string;amountSun:number;scheduledAt:Date;note?:string}[],
+  private async insert(rows:{kind:string;status:string;from:string;to:string;amountSun:number;scheduledAt:Date;note?:string;
+    campaignId?:string;campaignDay?:number;plannedAt?:Date;allocations?:{ownerAddress:string;amountSun:number}[]}[],
     transition:{status:string;phase?:string;lastPlanAt?:Date;event:string;detail:string}){
     const s=await this.state();
     const wallets=await this.db.wallet.findMany();const auto=new Map(wallets.map(w=>[w.address,w.autoApprove]));
     await this.db.$transaction(async tx=>{
       for(let i=0;i<rows.length;i++){
-        const r=rows[i];const status=auto.get(r.from)?'APPROVED':'PLANNED';
-        const t=await tx.transfer.create({data:{...r,status,sequence:s.nextSequence+i}});
+        const {allocations,...r}=rows[i];const status=auto.get(r.from)?'APPROVED':'PLANNED';
+        const t=await tx.transfer.create({data:{...r,status,approvalSource:auto.get(r.from)?'AUTO':null,sequence:s.nextSequence+i,
+          ...(allocations?{allocations:{create:allocations}}:{})}});
         await tx.audit.create({data:{event:'QUEUED',detail:`${r.kind} ${r.amountSun} Sun ${r.from} → ${r.to}; ${status}`,transferId:t.id}});
       }
       await tx.engineState.update({where:{id:1},data:{nextSequence:s.nextSequence+rows.length,status:transition.status,
@@ -342,8 +485,14 @@ export class EngineService {
   }
   async end(){return this.withLock(async()=>{
     const s=await this.state();
+    if(CAMPAIGN_PHASES.includes(s.phase)){
+      const campaign=await this.db.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId!}});
+      if(campaign.payAfterReturn)return {ok:true};
+      await this.requestCampaignReturn('Admin requested End: return attributed stakes, then pay exactly 1 TRX each',true);
+      await this.tickBody();return {ok:true};
+    }
     if(s.phase==='END_REQUESTED'||s.phase==='SETTLING')return {ok:true};
-    if(!['MIXING','REBALANCE_REQUESTED','REBALANCING'].includes(s.phase))throw new HttpError(409,`Cannot end in ${s.phase}`);
+    if(!['MIXING','LEGACY_PAUSED','REBALANCE_REQUESTED','REBALANCING'].includes(s.phase))throw new HttpError(409,`Cannot end in ${s.phase}`);
     await this.db.$transaction(async tx=>{
       await tx.engineState.update({where:{id:1},data:{phase:'END_REQUESTED',settlementFromSequence:s.nextSequence,
         rebalanceFromSequence:null,lastPlanAt:null,status:'Ending mix; reconciling any in-flight transfer'}});
@@ -361,7 +510,7 @@ export class EngineService {
   }
   async rebalancePreview(){return this.withLock(async()=>{
     const s=await this.state();
-    if(s.phase!=='MIXING')throw new HttpError(409,`Cannot preview rebalance in ${s.phase}`);
+    if(!['MIXING','LEGACY_PAUSED'].includes(s.phase))throw new HttpError(409,`Cannot preview rebalance in ${s.phase}`);
     const inFlight=await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}});
     if(inFlight){
       if(inFlight.status==='UNKNOWN')throw new HttpError(409,'Uncertain transaction requires manual investigation');
@@ -374,8 +523,12 @@ export class EngineService {
   });}
   async rebalance(){return this.withLock(async()=>{
     const s=await this.state();
+    if(CAMPAIGN_PHASES.includes(s.phase)){
+      await this.requestCampaignReturn('Admin requested attributed rebalance; campaign stops after restoration');
+      await this.tickBody();return {ok:true};
+    }
     if(['REBALANCE_REQUESTED','REBALANCING'].includes(s.phase))return {ok:true};
-    if(s.phase!=='MIXING')throw new HttpError(409,`Cannot rebalance in ${s.phase}`);
+    if(!['MIXING','LEGACY_PAUSED'].includes(s.phase))throw new HttpError(409,`Cannot rebalance in ${s.phase}`);
     const inFlight=await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}});
     if(inFlight?.status==='UNKNOWN')throw new HttpError(409,'Resolve the uncertain transaction before rebalancing');
     if(!inFlight&&!await this.reconcile())throw new HttpError(409,'Pool invariant violated; engine halted');
@@ -433,7 +586,12 @@ export class EngineService {
     }));
     const steps=settlementPlan(balances,this.config.teacherAddress);
     const now=new Date();
-    const rows=steps.map(x=>({...x,status:'PLANNED',scheduledAt:now}));
+    const state=await this.state();
+    const campaign=state.activeCampaignId?await this.db.campaign.findUnique({where:{id:state.activeCampaignId},include:{members:true}}):null;
+    const members=campaign?.members??[];
+    const rows=steps.map(x=>({...x,status:'PLANNED',scheduledAt:now,...(x.kind==='PAYOUT'&&members.some(m=>m.address===x.from)?{
+      campaignId:state.activeCampaignId!,campaignDay:Math.max(1,Math.floor((now.getTime()-campaign!.startedAt.getTime())/DAY)+1),plannedAt:now,
+      allocations:[{ownerAddress:x.from,amountSun:TARGET}]}:{})}));
     await this.insert(rows,{
       phase:'SETTLING',status:`Settlement map ready: ${steps.filter(s=>s.kind==='REBALANCE').length} balancing transfers and ${b.length} exact 1 TRX payouts; protected extra Sun stays in each wallet`,
       event:'SETTLEMENT_MAP',detail:`${steps.length} steps for ${b.length} joined wallets; ${balances.reduce((n,w)=>n+w.reserveSun,0)} extra Sun excluded from the game`
@@ -448,7 +606,7 @@ export class EngineService {
   }
   async setMixEnabled(address:string,enabled:boolean){return this.withLock(async()=>{
     const s=await this.state();
-    if(!['IDLE','MIXING'].includes(s.phase))throw new HttpError(409,`Cannot change participants in ${s.phase}`);
+    if(!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED'].includes(s.phase))throw new HttpError(409,`Campaign participants are fixed until restoration; cannot change them in ${s.phase}`);
     const wallet=await this.db.wallet.findUnique({where:{address}});
     if(!wallet)throw new HttpError(404,'Wallet not found');
     if(wallet.mixEnabled===enabled)return {ok:true};
@@ -501,7 +659,7 @@ export class EngineService {
     const s=await this.state();if(s.phase==='HALTED'||s.phase==='COMPLETE')throw new HttpError(409,'Engine is halted or complete');
     const t=await this.db.transfer.findUnique({where:{id}});
     if(!t||t.status!=='PLANNED')throw new HttpError(409,'Transfer is no longer awaiting approval');
-    await this.db.transfer.update({where:{id},data:{status:'APPROVED'}});
+    await this.db.transfer.update({where:{id},data:{status:'APPROVED',approvalSource:'MANUAL'}});
     await this.audit('APPROVED',`Manual approval: ${t.kind} ${t.amountSun} Sun ${t.from} → ${t.to}`,id);
     await this.tickBody();return {ok:true};
   });}
@@ -509,7 +667,8 @@ export class EngineService {
     const wallet=await this.db.wallet.findUnique({where:{address}});if(!wallet)throw new HttpError(404,'Wallet not found');
     await this.db.$transaction(async tx=>{
       await tx.wallet.update({where:{address},data:{autoApprove:enabled}});
-      if(enabled)await tx.transfer.updateMany({where:{from:address,status:'PLANNED'},data:{status:'APPROVED'}});
+      if(enabled)await tx.transfer.updateMany({where:{from:address,status:'PLANNED'},data:{status:'APPROVED',approvalSource:'AUTO'}});
+      else await tx.transfer.updateMany({where:{from:address,status:'APPROVED',approvalSource:'AUTO'},data:{status:'PLANNED',approvalSource:null}});
       await tx.audit.create({data:{event:'AUTOAPPROVE',detail:`${address}: ${enabled?'enabled':'disabled'}`}});
     });
     await this.tickBody();return {ok:true};
@@ -547,7 +706,9 @@ export class EngineService {
       await this.fatal(`Transaction ${t.txId} failed or cost ${r.feeSun} Sun`);return;
     }
     await this.db.$transaction(async tx=>{
-      await tx.transfer.update({where:{id:t.id},data:{status:'CONFIRMED',signedJson:null,bandwidthUsed:r.bandwidthUsed,confirmedAt:r.confirmedAt,note:`Confirmed: fee 0 Sun; ${r.bandwidthUsed===null?'Bandwidth not reported by node':`${r.bandwidthUsed} Bandwidth used`}`}});
+      const committed=await tx.transfer.updateMany({where:{id:t.id,status:{in:['SUBMITTING','SUBMITTED']}},data:{status:'CONFIRMED',signedJson:null,bandwidthUsed:r.bandwidthUsed,confirmedAt:r.confirmedAt,note:`Confirmed: fee 0 Sun; ${r.bandwidthUsed===null?'Bandwidth not reported by node':`${r.bandwidthUsed} Bandwidth used`}`}});
+      if(committed.count!==1)return; // duplicate receipt polling cannot debit ownership twice
+      await applyConfirmedOwnership(tx,t);
       // Keep the refill request in the same durable commit as the receipt.
       // If planning or the process fails next, startup retries with actual
       // resource data instead of leaving this sender without a queue slot.
@@ -561,6 +722,189 @@ export class EngineService {
     this.tron.invalidatePublicSnapshot();
   }
   async tick(){return this.withLock(()=>this.tickBody());}
+  private async createCampaignReturnMap(s:EngineState){
+    const c=await this.db.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId!},include:{members:true}});
+    const positions=await verifyOwnership(this.db,c.id),steps=attributedReturns(positions),wallets=await this.joined();
+    const ready=new Map<string,number>();
+    for(const from of new Set(steps.map(t=>t.from))){
+      const snapshot=await this.tron.bandwidthSnapshot(from);
+      const last=await this.db.transfer.findFirst({where:{from,status:'CONFIRMED'},orderBy:{sequence:'desc'}});
+      const earliest=last?Math.max(Date.now(),(last.confirmedAt??last.updatedAt).getTime()+DAY):Date.now();
+      ready.set(from,bufferedReadyAt(snapshot.limit,snapshot.available,snapshot.observedAt,earliest,MIN_FREE_BANDWIDTH,
+        await this.tron.recentBandwidthSpends(from))??Date.now()+DAY);
+    }
+    const counts=new Map<string,number>();
+    const planned=steps.map(t=>{const index=counts.get(t.from)??0;counts.set(t.from,index+1);
+      return {...t,scheduledAt:new Date(ready.get(t.from)!+index*DAY)};}).sort((a,b)=>a.scheduledAt.getTime()-b.scheduledAt.getTime());
+    const ids=planned.map(()=>randomUUID()),previous=new Map<string,string>();
+    await this.db.$transaction(async tx=>{
+      for(let i=0;i<planned.length;i++){
+        const {allocations,...t}=planned[i],auto=wallets.find(w=>w.address===t.from)!.autoApprove;
+        await tx.transfer.create({data:{...t,id:ids[i],campaignId:c.id,campaignDay:Math.max(1,Math.floor((t.scheduledAt.getTime()-c.startedAt.getTime())/DAY)+1),
+          plannedAt:t.scheduledAt,sequence:s.nextSequence+i,status:auto?'APPROVED':'PLANNED',approvalSource:auto?'AUTO':null,
+          dependsOnId:previous.get(t.from)??null,allocations:{create:allocations}}});
+        previous.set(t.from,ids[i]);
+      }
+      const payoutSequence=s.nextSequence+planned.length;
+      if(c.payAfterReturn){
+        for(let i=0;i<wallets.length;i++){
+          const w=wallets[i],owned=c.members.some(m=>m.address===w.address),at=new Date(Math.max(Date.now(),...planned.map(p=>p.scheduledAt.getTime()))+DAY);
+          await tx.transfer.create({data:{sequence:payoutSequence+i,kind:'PAYOUT',from:w.address,to:s.teacherAddress,amountSun:TARGET,
+            scheduledAt:at,plannedAt:at,status:w.autoApprove?'APPROVED':'PLANNED',approvalSource:w.autoApprove?'AUTO':null,
+            ...(owned?{campaignId:c.id,campaignDay:Math.max(1,Math.floor((at.getTime()-c.startedAt.getTime())/DAY)+1),
+              allocations:{create:[{ownerAddress:w.address,amountSun:TARGET}]}}:{})}});
+        }
+      }
+      await tx.campaign.update({where:{id:c.id},data:{status:'RETURNING'}});
+      await tx.engineState.update({where:{id:1},data:{phase:'CAMPAIGN_RETURNING',
+        nextSequence:payoutSequence+(c.payAfterReturn?wallets.length:0),settlementFromSequence:c.payAfterReturn?payoutSequence:null,
+        status:`Return map ready: ${planned.length} attributed transfers${c.payAfterReturn?` and ${wallets.length} exact teacher payouts`:''}; approvals and live Bandwidth checks required`}});
+      await tx.audit.create({data:{event:'CAMPAIGN_RETURN_MAP',detail:`${planned.length} direct transfers return original attributed stakes; ${c.returnReason??'scheduled closure'}; teacher payouts ${c.payAfterReturn?'included':'excluded'}`}});
+    },{timeout:60_000});
+  }
+  private async tickCampaign(s:EngineState,b:PoolBalance[]){
+    const c=await this.db.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId!},include:{members:true}});
+    if(s.phase==='CAMPAIGN_RESTORED')return;
+    if(s.phase==='CAMPAIGN_RETURN_REQUESTED'){await this.createCampaignReturnMap(s);s=await this.state();}
+    if(s.phase==='CAMPAIGN'){
+      const mix=await this.db.transfer.findFirst({where:{campaignId:c.id,kind:'MIX',status:{in:['PLANNED','APPROVED','PAUSED']}},orderBy:{sequence:'asc'}});
+      if(!mix){
+        await this.db.$transaction(async tx=>{
+          await tx.campaign.update({where:{id:c.id},data:{status:'RETURNING',returnReason:'Scheduled complete-plan return'}});
+          await tx.engineState.update({where:{id:1},data:{phase:'CAMPAIGN_RETURNING',status:'Mixing complete; returning every attributed stake to its owner'}});
+          await tx.audit.create({data:{event:'CAMPAIGN_MIX_COMPLETE',detail:'All planned mixing rounds confirmed; using the persisted closing map'}});
+        });
+        s=await this.state();
+      }else{
+        const positions=await this.db.ownershipBalance.findMany({where:{campaignId:c.id}}),returns=attributedReturns(positions);
+        const perSender=new Map<string,number>();for(const r of returns)perSender.set(r.from,(perSender.get(r.from)??0)+1);
+        const final=await this.db.transfer.findFirst({where:{campaignId:c.id,kind:'RETURN',status:{in:['PLANNED','APPROVED','PAUSED']}},orderBy:{scheduledAt:'desc'}});
+        // Stop expanding routes while enough time remains to return the
+        // currently attributed funds. Manual mode still needs approvals.
+        const returnBudget=Math.max(1,...perSender.values())*DAY;
+        if(Date.now()+returnBudget+4*DAY>=c.deadlineAt.getTime()||final&&final.scheduledAt.getTime()>c.deadlineAt.getTime()-4*DAY){
+          await this.requestCampaignReturn('Deadline guard: preserving time for attributed returns and payouts');
+          await this.createCampaignReturnMap(await this.state());return;
+        }
+      }
+    }
+    const kind=s.phase==='CAMPAIGN'?'MIX':'RETURN';
+    const candidates=await this.db.transfer.findMany({where:{campaignId:c.id,kind,status:{in:['PLANNED','APPROVED','PAUSED']}},
+      orderBy:kind==='MIX'?{sequence:'asc'}:[{scheduledAt:'asc'},{sequence:'asc'}],include:{allocations:true}});
+    let next=candidates[0];
+    if(kind==='RETURN'){
+      // Returns to different owners/senders are independent. A low-resource
+      // wallet must not block ready returns from all other wallets.
+      const heads=new Map<string,typeof next>();
+      for(const row of candidates)if(!heads.has(row.from)||row.sequence<heads.get(row.from)!.sequence)heads.set(row.from,row);
+      const pending=[...heads.values()].sort((a,b)=>a.scheduledAt.getTime()-b.scheduledAt.getTime());
+      next=pending.find(t=>t.status==='APPROVED'&&t.scheduledAt.getTime()<=Date.now())??pending[0];
+    }
+    if(!next){
+      const positions=await verifyOwnership(this.db,c.id);
+      if(c.members.some(m=>positions.filter(p=>p.ownerAddress===m.address).reduce((n,p)=>n+p.amountSun,0)!==TARGET||
+        positions.some(p=>p.ownerAddress===m.address&&p.holderAddress!==m.address)))throw new OwnershipError('Closing queue ended before returning every original 1 TRX');
+      await this.db.$transaction(async tx=>{
+        await tx.campaign.update({where:{id:c.id},data:{status:'RESTORED'}});
+        await tx.engineState.update({where:{id:1},data:{phase:c.payAfterReturn?'SETTLING':'CAMPAIGN_RESTORED',
+          status:c.payAfterReturn?'Original stakes restored; teacher payout map awaiting execution':'Campaign restored: every original 1 TRX is back; mixing stopped; reports and history retained'}});
+        await tx.audit.create({data:{event:'CAMPAIGN_RESTORED',detail:'Every original attributed stake returned to its owner; personal extra Sun remains outside the game'}});
+      });return;
+    }
+    if(next.dependsOnId){
+      const predecessor=await this.db.transfer.findUniqueOrThrow({where:{id:next.dependsOnId}});
+      if(predecessor.status!=='CONFIRMED'){
+        await this.db.engineState.update({where:{id:1},data:{status:`Waiting for confirmed predecessor #${predecessor.sequence} before #${next.sequence}`}});return;
+      }
+    }
+    if(next.status==='PLANNED'){
+      await this.db.engineState.update({where:{id:1},data:{status:`Awaiting approval: day ${next.campaignDay}, ${next.kind} #${next.sequence}`}});return;
+    }
+    if(next.scheduledAt.getTime()>Date.now()){
+      await this.db.engineState.update({where:{id:1},data:{status:`Next ${next.kind} #${next.sequence}: ${next.scheduledAt.toISOString()}; waiting for its time and live resource check`}});return;
+    }
+    for(const a of next.allocations){
+      const position=await this.db.ownershipBalance.findUnique({where:{campaignId_ownerAddress_holderAddress:{campaignId:c.id,ownerAddress:a.ownerAddress,holderAddress:next.from}}});
+      if(!position||position.amountSun<a.amountSun)throw new OwnershipError(`Planned #${next.sequence} cannot spend ${a.ownerAddress}'s attributed share`);
+    }
+    await this.executeTransfer(next,b);
+  }
+
+  private async executeTransfer(next:Transfer,b:PoolBalance[]){
+    if(next.campaignId){
+      const [allocations,members]=await Promise.all([
+        this.db.allocation.findMany({where:{transferId:next.id}}),this.db.campaignMember.findMany({where:{campaignId:next.campaignId}})
+      ]);
+      if(!allocations.length||allocations.reduce((n,a)=>n+a.amountSun,0)!==next.amountSun||
+        allocations.some(a=>!Number.isSafeInteger(a.amountSun)||a.amountSun<=0||!members.some(m=>m.address===a.ownerAddress)))
+        throw new OwnershipError(`Invalid frozen contributions before signing #${next.sequence}`);
+      for(const a of allocations){
+        const position=await this.db.ownershipBalance.findUnique({where:{campaignId_ownerAddress_holderAddress:{campaignId:next.campaignId,ownerAddress:a.ownerAddress,holderAddress:next.from}}});
+        if(!position||position.amountSun<a.amountSun)throw new OwnershipError(`Ownership deficit before signing #${next.sequence}`);
+      }
+      if(next.kind==='PAYOUT'&&(allocations.length!==1||allocations[0].ownerAddress!==next.from||next.amountSun!==TARGET))
+        throw new OwnershipError('Teacher payout cannot spend another participant\'s attributed stake');
+    }
+    if(next.campaignId&&["MIX","RETURN"].includes(next.kind)){
+      const last=await this.db.transfer.findFirst({where:{from:next.from,status:"CONFIRMED"},orderBy:{sequence:"desc"}});
+      if(last&&(last.confirmedAt??last.updatedAt).getTime()+DAY>Date.now()){
+        const until=new Date((last.confirmedAt??last.updatedAt).getTime()+DAY);
+        await this.delayTransfer(next,until,"Conservative daily sender slot after the last confirmed transfer");
+        await this.db.engineState.update({where:{id:1},data:{status:`Waiting for the next daily sender slot: ${until.toISOString()}`}});return;
+      }
+    }
+      const sender=b.find(w=>w.address===next.from)!;
+      const senderWallet=await this.db.wallet.findUniqueOrThrow({where:{address:next.from}});
+      const reserve=senderWallet.entryBalanceSun!-TARGET;
+      if(sender.sun-reserve<next.amountSun){
+        // Forecast assumed earlier approvals; never send when live balance disagrees.
+        await this.db.transfer.update({where:{id:next.id},data:{status:'PAUSED',note:'Live balance insufficient; manual investigation required'}});
+        await this.fatal(`Insufficient game balance for transfer #${next.sequence}; extra Sun is reserved`);return;
+      }
+      if(next.kind==='PAYOUT'&&sender.sun!==senderWallet.entryBalanceSun){await this.fatal(`Payout wallet ${next.from} holds ${sender.sun}, expected ${senderWallet.entryBalanceSun} including reserved Sun`);return;}
+      await this.db.engineState.update({where:{id:1},data:{status:`Preflight ${next.kind.toLowerCase()} #${next.sequence} from ${next.from}`}});
+      let prepared;
+      try{prepared=await this.tron.prepare(next.from,next.to,next.amountSun);}catch(e){
+        if(e instanceof BandwidthWait){
+          await this.delayTransfer(next,e.nextCheckAt,`Bandwidth: ${e.message}`);
+          await this.db.engineState.update({where:{id:1},data:{status:`Waiting for bandwidth: ${next.from}; ${e.message}`}});return;
+        }throw e;
+      }
+      // Persist tx ID BEFORE broadcast. Any crash/error from this point pauses, never rebuilds.
+      await this.db.transfer.update({where:{id:next.id},data:{status:'SUBMITTING',txId:prepared.txId,signedJson:prepared.signedJson,note:`Preflight ${prepared.bytes} bytes`}});
+      try{
+        await this.tron.broadcast(next.from,next.to,next.amountSun,prepared.txId,prepared.signedJson,prepared.bytes);
+        await this.db.transfer.update({where:{id:next.id},data:{status:'SUBMITTED'}});
+        await this.audit('SUBMITTED',`${next.kind} #${next.sequence} tx ${prepared.txId}`,next.id);
+        await this.db.engineState.update({where:{id:1},data:{status:`Waiting for receipt: ${next.kind.toLowerCase()} #${next.sequence}`}});
+      }catch(e){
+        if(e instanceof BandwidthWait){
+          // This typed error is thrown before any network broadcast call.
+          await this.db.transfer.update({where:{id:next.id},data:{status:'APPROVED',txId:null,signedJson:null}});
+          await this.delayTransfer(next,e.nextCheckAt,`Bandwidth changed before broadcast: ${e.message}`);
+          await this.db.engineState.update({where:{id:1},data:{status:`Waiting for bandwidth before transfer #${next.sequence}: ${e.message}`}});
+          return;
+        }
+        // The node may have accepted the signed transaction despite an RPC
+        // error. Keep its ID and wait for chain evidence, even after a restart.
+        await this.db.transfer.update({where:{id:next.id},data:{note:`Broadcast outcome uncertain: ${String(e)}`}});
+        await this.audit('BROADCAST_UNCERTAIN',`Persisted tx ${prepared.txId}; polling without rebroadcast`,next.id);
+        await this.db.engineState.update({where:{id:1},data:{status:`Broadcast response uncertain for ${prepared.txId}; recovering by txID`}});
+      }
+  }
+
+  private async delayTransfer(t:Transfer,until:Date,note:string){
+    const delta=Math.max(0,until.getTime()-t.scheduledAt.getTime());
+    await this.db.$transaction(async tx=>{
+      if(t.campaignId&&delta>0){
+        const rows=await tx.transfer.findMany({where:{campaignId:t.campaignId,sequence:{gt:t.sequence},status:{in:['PLANNED','APPROVED','PAUSED']},
+          ...(t.kind==='MIX'?{}:{from:t.from})},select:{id:true,scheduledAt:true}});
+        for(const row of rows)await tx.transfer.update({where:{id:row.id},data:{scheduledAt:new Date(row.scheduledAt.getTime()+delta)}});
+      }
+      await tx.transfer.update({where:{id:t.id},data:{scheduledAt:until,note}});
+      if(t.campaignId)await tx.audit.create({data:{event:'CAMPAIGN_DELAY',transferId:t.id,detail:`#${t.sequence} delayed to ${until.toISOString()}; dependent future windows shifted; routes, ownership and approvals retained`}});
+    },{timeout:30_000});
+  }
   private async tickBody(){
     let s=await this.state();
     if(['IDLE','COMPLETE','HALTED'].includes(s.phase))return;
@@ -575,6 +919,19 @@ export class EngineService {
       }
       let b=await this.reconcile();if(!b)return;
       s=await this.state();
+      if(s.activeCampaignId){
+        const positions=await verifyOwnership(this.db,s.activeCampaignId);
+        const members=await this.db.campaignMember.findMany({where:{campaignId:s.activeCampaignId}});
+        const joined=await this.joined();
+        for(const member of members){
+          const owned=positions.filter(p=>p.holderAddress===member.address).reduce((n,p)=>n+p.amountSun,0);
+          const wallet=joined.find(w=>w.address===member.address)!;
+          if(b.find(w=>w.address===member.address)!.sun!==owned+wallet.entryBalanceSun!-TARGET)
+            throw new OwnershipError(`Wallet ${member.address} differs from confirmed attributed funds and personal reserve`);
+        }
+      }
+      if(CAMPAIGN_PHASES.includes(s.phase)){await this.tickCampaign(s,b);return;}
+      if(s.phase==='LEGACY_PAUSED')return;
       if(s.phase==='MIXING'&&await this.joinSelected()){
         b=await this.reconcile();if(!b)return;
       }
@@ -611,12 +968,12 @@ export class EngineService {
           }
           const count=await this.db.transfer.count({where:{kind:'REBALANCE',status:'CONFIRMED',sequence:{gte:s.rebalanceFromSequence!}}});
           await this.db.$transaction(async tx=>{
-            await tx.engineState.update({where:{id:1},data:{phase:'MIXING',rebalanceFromSequence:null,
+            await tx.engineState.update({where:{id:1},data:{phase:this.campaignOnly?'LEGACY_PAUSED':'MIXING',rebalanceFromSequence:null,
               lastPlanAt:null,mixAmountCursor:0,mixLastReceiver:null,
-              status:`Rebalance complete: ${count} transfers; each joined wallet again has 1 TRX plus its protected extra Sun`}});
-            await tx.audit.create({data:{event:'REBALANCE_COMPLETE',detail:`${count} transfers confirmed; each joined wallet restored; mixing resumed`}});
+              status:`Rebalance complete: ${count} transfers; each joined wallet again has 1 TRX plus its protected extra Sun${this.campaignOnly?'; old mixer paused':''}`}});
+            await tx.audit.create({data:{event:'REBALANCE_COMPLETE',detail:`${count} transfers confirmed; each joined wallet restored; ${this.campaignOnly?'old mixer paused for the new campaign':'mixing resumed'}`}});
           });
-          await this.plan(b);
+          if(!this.campaignOnly)await this.plan(b);
           return;
         }
         if(s.phase==='SETTLING'){
@@ -624,6 +981,7 @@ export class EngineService {
           if(b.some(w=>w.sun!==joined.find(j=>j.address===w.address)!.entryBalanceSun!-TARGET)){await this.fatal('Settlement queue exhausted without restoring protected extra Sun');return;}
           await this.db.$transaction(async tx=>{
             await tx.engineState.update({where:{id:1},data:{phase:'COMPLETE',status:'Complete: each joined wallet sent exactly 1 TRX; protected extra Sun remains in its wallet'}});
+            if(s.activeCampaignId)await tx.campaign.update({where:{id:s.activeCampaignId},data:{status:'PAID'}});
             await tx.audit.create({data:{event:'COMPLETE',detail:'All joined-wallet 1 TRX payouts confirmed'}});
           });
         }
@@ -638,44 +996,9 @@ export class EngineService {
           return;
         }
       }
-      const sender=b.find(w=>w.address===next.from)!;
-      const senderWallet=await this.db.wallet.findUniqueOrThrow({where:{address:next.from}});
-      const reserve=senderWallet.entryBalanceSun!-TARGET;
-      if(sender.sun-reserve<next.amountSun){
-        // Forecast assumed earlier approvals; never send when live balance disagrees.
-        await this.db.transfer.update({where:{id:next.id},data:{status:'PAUSED',note:'Live balance insufficient; manual investigation required'}});
-        await this.fatal(`Insufficient game balance for transfer #${next.sequence}; extra Sun is reserved`);return;
-      }
-      if(next.kind==='PAYOUT'&&sender.sun!==senderWallet.entryBalanceSun){await this.fatal(`Payout wallet ${next.from} holds ${sender.sun}, expected ${senderWallet.entryBalanceSun} including reserved Sun`);return;}
-      await this.db.engineState.update({where:{id:1},data:{status:`Preflight ${next.kind.toLowerCase()} #${next.sequence} from ${next.from}`}});
-      let prepared;
-      try{prepared=await this.tron.prepare(next.from,next.to,next.amountSun);}catch(e){
-        if(e instanceof BandwidthWait){
-          await this.db.transfer.update({where:{id:next.id},data:{note:`Bandwidth: ${e.message}`,scheduledAt:e.nextCheckAt}});
-          await this.db.engineState.update({where:{id:1},data:{status:`Waiting for bandwidth: ${next.from}; ${e.message}`}});return;
-        }throw e;
-      }
-      // Persist tx ID BEFORE broadcast. Any crash/error from this point pauses, never rebuilds.
-      await this.db.transfer.update({where:{id:next.id},data:{status:'SUBMITTING',txId:prepared.txId,signedJson:prepared.signedJson,note:`Preflight ${prepared.bytes} bytes`}});
-      try{
-        await this.tron.broadcast(next.from,next.to,next.amountSun,prepared.txId,prepared.signedJson,prepared.bytes);
-        await this.db.transfer.update({where:{id:next.id},data:{status:'SUBMITTED'}});
-        await this.audit('SUBMITTED',`${next.kind} #${next.sequence} tx ${prepared.txId}`,next.id);
-        await this.db.engineState.update({where:{id:1},data:{status:`Waiting for receipt: ${next.kind.toLowerCase()} #${next.sequence}`}});
-      }catch(e){
-        if(e instanceof BandwidthWait){
-          // This typed error is thrown before any network broadcast call.
-          await this.db.transfer.update({where:{id:next.id},data:{status:'APPROVED',txId:null,signedJson:null,note:`Bandwidth changed before broadcast: ${e.message}`,scheduledAt:e.nextCheckAt}});
-          await this.db.engineState.update({where:{id:1},data:{status:`Waiting for bandwidth before transfer #${next.sequence}: ${e.message}`}});
-          return;
-        }
-        // The node may have accepted the signed transaction despite an RPC
-        // error. Keep its ID and wait for chain evidence, even after a restart.
-        await this.db.transfer.update({where:{id:next.id},data:{note:`Broadcast outcome uncertain: ${String(e)}`}});
-        await this.audit('BROADCAST_UNCERTAIN',`Persisted tx ${prepared.txId}; polling without rebroadcast`,next.id);
-        await this.db.engineState.update({where:{id:1},data:{status:`Broadcast response uncertain for ${prepared.txId}; recovering by txID`}});
-      }
+      await this.executeTransfer(next,b);
     }catch(e){
+      if(e instanceof OwnershipError){await this.fatal(e.message);return;}
       // RPC outages cannot be treated as a zero balance. Pause, preserve queue and retry.
       if((await this.state()).phase!=='HALTED')await this.db.engineState.update({where:{id:1},data:{status:`RPC unavailable or preflight failed: ${String(e)}; retrying safely`}});
       console.error('Engine tick:',e instanceof Error?e.message:String(e));

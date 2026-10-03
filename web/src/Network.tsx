@@ -1,7 +1,7 @@
 import {useEffect,useRef} from 'react';
 import cytoscape from 'cytoscape';
 
-export type GraphEdge={id:string;sequence:number;kind:string;status:string;from:string;to:string;amountSun:number;scheduledAt:string;txId:string|null;note:string|null;bandwidthUsed?:number|null;confirmedAt?:string|null;updatedAt?:string};
+export type GraphEdge={id:string;sequence:number;kind:string;status:string;from:string;to:string;amountSun:number;scheduledAt:string;txId:string|null;note:string|null;bandwidthUsed?:number|null;confirmedAt?:string|null;updatedAt?:string;campaignId?:string|null;campaignDay?:number|null};
 export type Graph={nodes:{id:string;label:string;mixEnabled:boolean;joined:boolean}[];edges:GraphEdge[];currentMapFromSequence?:number|null};
 export type GraphMode='forecast'|'history'|'settlement'|'all';
 export type RouteGroup={id:string;from:string;to:string;kind:string;phase:'confirmed'|'upcoming';count:number;totalSun:number;transfers:GraphEdge[]};
@@ -10,11 +10,18 @@ const POSITION_KEY='trx-pool-node-positions-v1';
 
 export function groupRoutes(graph:Graph,mode:GraphMode):RouteGroup[]{
   const routes=new Map<string,RouteGroup>();
+  const nearest=new Set<string>(),senders=new Set<string>();
+  if(mode==='forecast')for(const row of graph.edges){
+    if(row.campaignId&&row.kind==='MIX'&&!['CANCELLED','CONFIRMED'].includes(row.status)&&!senders.has(row.from)){
+      senders.add(row.from);nearest.add(row.id);
+    }
+  }
   for(const transfer of graph.edges){
     if(transfer.status==='CANCELLED')continue;
     if(mode==='forecast'&&(transfer.kind!=='MIX'||transfer.status==='CONFIRMED'))continue;
+    if(mode==='forecast'&&transfer.campaignId&&!nearest.has(transfer.id))continue;
     if(mode==='history'&&transfer.status!=='CONFIRMED')continue;
-    if(mode==='settlement'&&(!['REBALANCE','PAYOUT'].includes(transfer.kind)||
+    if(mode==='settlement'&&(!['REBALANCE','RETURN','PAYOUT'].includes(transfer.kind)||
       (graph.currentMapFromSequence!=null&&transfer.sequence<graph.currentMapFromSequence)))continue;
     const phase=transfer.status==='CONFIRMED'?'confirmed':'upcoming';
     const id=`route:${phase}:${transfer.kind}:${transfer.from}:${transfer.to}`;
@@ -74,7 +81,7 @@ export function Network({graph,routes,selected,selectedRouteId,onSelect,onRouteS
         {selector:'node[?teacher]',style:{'background-color':'#a67532','border-color':'#f5bd66','width':42,'height':42,'shape':'diamond'}},
         {selector:'edge',style:{'width':'mapData(count,1,12,2.2,5)','line-color':'#b9f35a','target-arrow-color':'#b9f35a','target-arrow-shape':'triangle','arrow-scale':1.25,'curve-style':'bezier','opacity':.84,'line-style':'dashed'}},
         {selector:'edge[phase="confirmed"]',style:{'line-style':'solid','line-color':'#62d9d1','target-arrow-color':'#62d9d1'}},
-        {selector:'edge[kind="REBALANCE"],edge[kind="PAYOUT"]',style:{'line-color':'#f5bd66','target-arrow-color':'#f5bd66'}},
+        {selector:'edge[kind="REBALANCE"],edge[kind="RETURN"],edge[kind="PAYOUT"]',style:{'line-color':'#f5bd66','target-arrow-color':'#f5bd66'}},
         {selector:'edge:selected,edge.hover',style:{'opacity':1,'width':5,'label':'data(label)','font-size':11,'color':'#f1f8fe','text-background-color':'#102132','text-background-opacity':1,'text-background-padding':'5px','z-index':10}},
         {selector:'node:selected',style:{'border-color':'#fff','border-width':5}}
       ]});
@@ -108,7 +115,7 @@ export function Network({graph,routes,selected,selectedRouteId,onSelect,onRouteS
     instance.batch(()=>{
       instance.elements().filter(element=>!wanted.has(element.id())).remove();
       for(const node of graph.nodes){
-        const data={id:node.id,label:node.label==='Teacher'?'T':node.label.replace('Node ',''),teacher:node.label==='Teacher',enabled:node.mixEnabled,joined:node.joined};
+        const data={id:node.id,label:node.label==='Teacher'?'T':node.label.startsWith('Teacher')?'T*':node.label.replace('Node ',''),teacher:node.label.startsWith('Teacher'),enabled:node.mixEnabled,joined:node.joined};
         const remembered=pinned.current.get(node.id);
         const position=remembered&&!reset?{x:remembered.x*width,y:remembered.y*height}:defaults.get(node.id)!;
         const element=instance.getElementById(node.id);
