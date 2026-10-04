@@ -94,4 +94,18 @@
 .history-overlay{z-index:6}.overlay:not(.history-overlay){z-index:8}
 @media(max-width:650px){.campaign-inputs{grid-template-columns:1fr}.ownership-canvas{height:380px}.history-dialog{max-height:96vh}.owner-positions>span{max-width:100%}}
 
-.plan-manager{margin:22px 0}.plan-prepare{display:flex;flex-wrap:wrap;align-items:end;gap:12px;margin:16px 0}.plan-prepare label{display:grid;gap:6px;font-size:12px;color:var(--muted)}.plan-prepare input,.plan-prepare select{max-width:100%;min-height:38px}.plan-prepare button{min-height:38px}.plan-comparison{max-height:530px}.plan-manager .report-facts{flex-wrap:wrap}.tag.draft{color:#bcc6e5;background:#23304d}
+.plan-manager{margin:22px 0}
+.plan-prepare{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;margin:16px 0}
+.plan-prepare label{display:grid;gap:7px;min-width:0;max-width:100%;font-size:12px;color:#a1b9c5}
+.plan-prepare input,.plan-prepare select{max-width:100%;min-width:0;min-height:42px;color-scheme:dark}
+.plan-prepare input[type=number]{width:142px}
+.plan-prepare input[type=date]{width:210px}
+.plan-action{display:inline-flex;align-items:center;justify-content:center;min-height:42px;max-width:100%;padding:10px 15px;border:1px solid #49697f;border-radius:8px;background:#203649;color:#d6e8f1;font-size:12px;font-weight:700;line-height:1.5;text-align:center;transition:background-color .15s,border-color .15s,color .15s}
+.plan-action.primary{border-color:#b9f35a;background:#b9f35a;color:#0c1b17}
+.plan-action:hover:not(:disabled){border-color:#84b6cc;background:#2a455b}
+.plan-action.primary:hover:not(:disabled){border-color:#ceff83;background:#ceff83}
+.plan-action:disabled{opacity:1;border-color:#314758;background:#1b2937;color:#8da1b0;cursor:not-allowed}
+.plan-action:focus-visible,.plan-prepare input:focus-visible,.plan-prepare select:focus-visible{outline:2px solid #b9f35a;outline-offset:3px}
+.plan-selection{display:inline-flex;align-items:center;min-height:42px;padding:9px 12px;border:1px solid #35585c;border-radius:8px;background:#18353b;color:#b8dccd;font-size:12px;font-weight:700;line-height:1.5;overflow-wrap:anywhere}
+.plan-comparison{max-height:530px}.plan-manager .report-facts{flex-wrap:wrap}.tag.draft{color:#bcc6e5;background:#23304d}
+@media(max-width:650px){.plan-prepare label,.plan-prepare .plan-action,.plan-selection{width:100%}.plan-prepare input,.plan-prepare input[type=number],.plan-prepare input[type=date],.plan-prepare select{width:100%}}
