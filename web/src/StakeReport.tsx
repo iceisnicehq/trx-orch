@@ -7,11 +7,12 @@ type Share={ownerAddress:string;amountSun:number};
 type ReportEvent={id:string;sequence:number;kind:string;status:string;from:string;to:string;amountSun:number;ownerSun:number|null;
   campaignDay?:number|null;plannedAt:string|null;scheduledAt:string;confirmedAt:string|null;updatedAt?:string;
   bandwidthUsed:number|null;txId:string|null;allocations:Share[];fromComposition:Share[]|null;toComposition:Share[]|null;
-  reportSection?:'PREHISTORY';attributionBasis?:'UNRECORDED'|'RECORDED';legacyMode?:string};
+  reportSection?:'PREHISTORY';attributionBasis?:'RECONSTRUCTED'|'RECORDED';attributionMethod?:'FIFO'|'RECORDED';legacyMode?:string};
 type Member={address:string;ordinal:number};
 type Report={address:string;profile:{type:string;releaseDay:number;quarterDay:number;eighthDay:number|null};
   campaign:{id:string;variantId?:string;status:string;totalDays:number;timingMode?:string;members:Member[]};events:ReportEvent[];
-  prehistory:null|{enabled:boolean;events:ReportEvent[];wallets:Member[];unrecordedCount:number;notice:string};
+  prehistory:null|{enabled:boolean;events:ReportEvent[];wallets:Member[];reconstructedCount:number;recordedCount:number;
+    notice:string;complete:boolean;issues:{sequence:number;detail:string}[];positionsAtEnd:Position[]};
   positions:Position[];finalPositions:Position[];flow:Flow;cancelled:ReportEvent[];plannedMixSends:number};
 const fmt=(sun:number)=>(sun/1_000_000).toFixed(6)+' TRX';
 const when=(s:string|null|undefined)=>s?new Date(s).toLocaleString('en-GB',{timeZone:'Europe/Moscow',hour12:false})+' MSK':'Не сохранено';
@@ -40,10 +41,10 @@ export function StakeReport({address,revision,variantId}:{address:string;revisio
   const historyOptions=<div className="report-history-options">
     <label className="report-history-toggle"><input type="checkbox" checked={includePrehistory} onChange={e=>{
       setIncludePrehistory(e.target.checked);saveHistoryPreference('graph',e.target.checked);setSelectedId(null);
-    }}/><span>Предыстория в схеме и таблице<small>Подтверждённые переводы до выбранного плана: RANDOM, LIST, Rebalance и прежние кампании.</small></span></label>
+    }}/><span>Моя предыстория в схеме и таблице<small>Только переводы моей доли до плана. Для RANDOM/LIST применяется расчёт FIFO.</small></span></label>
     <label className="report-history-toggle"><input type="checkbox" checked={includeCsvPrehistory} onChange={e=>{
       setIncludeCsvPrehistory(e.target.checked);saveHistoryPreference('csv',e.target.checked);
-    }}/><span>Добавить предысторию в CSV<small>Независимо от переключателя схемы. Неизвестная доля владельца остаётся пустой.</small></span></label>
+    }}/><span>Добавить мою предысторию в CSV<small>Только строки с моей долей. Правило FIFO отмечено отдельно от сохранённого учёта SMART.</small></span></label>
   </div>;
   if(!report)return <div className="stake-report">{archiveSelect}{historyOptions}
     {error&&<p className="history-intro">Для этого кошелька отчёт не загрузился. История адреса доступна на соседней вкладке.<br/>{error}</p>}{loading&&<p>Загрузка плана…</p>}</div>;
@@ -69,9 +70,12 @@ export function StakeReport({address,revision,variantId}:{address:string;revisio
     {historyOptions}
     {report.campaign.variantId&&<p className="campaign-warning">Предпросмотр сохранённого варианта. День 1 отсчитывается от будущего Start; показанные даты — ориентир генерации. Дедлайн остаётся фиксированным. DRAFT не является одобрением.</p>}
     <p className="history-intro">Здесь движение исходного <b>1 TRX этого участника</b> в выбранном плане, включая переводы между чужими адресами. Принадлежность долей задаёт сохранённый учёт кампании; в TRON монеты не имеют метки владельца.</p>
-    {showPrehistory&&<div className="report-prehistory-notice"><b>{history.length} прежних подтверждённых переводов в связанной группе.</b>
-      <p>{report.prehistory!.notice}</p>{!history.length&&<small>До выбранного плана связанных подтверждённых переводов в базе нет.</small>}
-      {report.prehistory!.unrecordedCount>0&&<small>В {report.prehistory!.unrecordedCount} переводах доли владельцев не зафиксированы. Янтарная часть схемы показывает реальные суммы переводов и порядок операций; серые пунктирные связи показывают контекст.</small>}</div>}
+    {showPrehistory&&<div className="report-prehistory-notice"><b>{history.length} прежних подтверждённых переводов с моей долей.</b>
+      <p>{report.prehistory!.notice}</p>{!history.length&&<small>До выбранного плана переводов с этой долей в сохранённой истории нет.</small>}
+      {report.prehistory!.reconstructedCount>0&&<small>{report.prehistory!.reconstructedCount} шагов рассчитаны по FIFO; {report.prehistory!.recordedCount} используют сохранённые доли SMART. Сумма моей доли отличается от суммы всего перевода.</small>}
+      {!report.prehistory!.complete&&<p role="alert">Предыстория частичная: расчёт остановлен у пропуска или противоречия в журнале. Новые средства для покрытия пропуска не создаются. Проблемные шаги: {report.prehistory!.issues.map(i=>'#'+i.sequence).join(', ')}.</p>}
+      {report.prehistory!.positionsAtEnd.length>0&&<p>Доля к концу последнего показанного периода учёта: {report.prehistory!.positionsAtEnd.map(p=>name(p.holderAddress)+' '+fmt(p.amountSun)).join(' + ')}. Начало SMART задаёт новый учёт ставки; ребаланс балансов сам по себе не обнуляет FIFO.</p>}
+    </div>}
     <div className="report-facts"><span>{report.events.length} шагов ставки в выбранном плане</span><span>{report.flow.splits} разветвлений · {report.flow.merges} объединений в плане</span><span>{report.plannedMixSends} MIX-отправок с адреса</span></div>
     <p className="history-intro">Профиль: {report.profile.type}. Допуск первого дробления — день {report.profile.releaseDay}; долей 0,25 — день {report.profile.quarterDay}{report.profile.eighthDay!==null?`; 0,125 — день ${report.profile.eighthDay}`:'; доли 0,125 для этого участника не используются'}. Фактические разветвления видны на схеме.</p>
     <div className="owner-positions"><b>Где находится этот 1 TRX по подтверждённому учёту выбранного плана:</b>{report.positions.length?report.positions.map(p=><span key={p.holderAddress}>{name(p.holderAddress)} · {fmt(p.amountSun)}<small>{p.holderAddress}</small></span>):<span>Ставка выплачена учителю.</span>}</div>
@@ -81,14 +85,14 @@ export function StakeReport({address,revision,variantId}:{address:string;revisio
     <div className="report-table table-wrap"><table><thead><tr><th>Этап / №</th><th>Маршрут</th><th>Моя доля</th><th>Весь перевод</th><th>Время MSK</th><th>Статус</th></tr></thead><tbody>{rows.map(t=><tr key={t.id} className={selected?.id===t.id?'selected':''} onClick={()=>setSelectedId(t.id)} tabIndex={0} onKeyDown={e=>{if(e.key==='Enter')setSelectedId(t.id)}}>
       <td>{t.reportSection==='PREHISTORY'?'До плана':t.campaignDay} / #{t.sequence}<small className={t.reportSection==='PREHISTORY'?'report-history-badge':''}>{t.legacyMode??t.kind}</small></td>
       <td title={`${t.from} → ${t.to}`}>{name(t.from)} → {name(t.to)}</td><td>{t.ownerSun===null?'Не зафиксирована':fmt(t.ownerSun)}</td>
-      <td>{fmt(t.amountSun)}<small>{t.attributionBasis==='UNRECORDED'?'Состав не записывался':`${t.allocations.length} вкладов`}</small></td>
+      <td>{fmt(t.amountSun)}<small>{t.attributionBasis==='RECONSTRUCTED'?'Доля рассчитана по FIFO':t.allocations.length+' вкладов'}</small></td>
       <td>{when(t.confirmedAt??(t.status==='CONFIRMED'?t.updatedAt:undefined)??t.scheduledAt)}<small>{t.confirmedAt?'Подтверждено в блоке':t.status==='CONFIRMED'?'Время записи подтверждения':'Окно отправки; возможен сдвиг'}</small></td><td className="tag">{t.status}</td></tr>)}</tbody></table></div>
     {selected&&<section className="report-detail"><b>#{selected.sequence} · {name(selected.from)} → {name(selected.to)}</b><p className="full-address">{selected.from}<br/>→ {selected.to}</p>
-      <p>Весь перевод: {fmt(selected.amountSun)}.{selected.attributionBasis==='UNRECORDED'?' Доля этого владельца и состав старого перевода не записывались.':` Состав: ${composition(selected.allocations)}.`}</p>
+      <p>Весь перевод: {fmt(selected.amountSun)}. Состав: {composition(selected.allocations)}.{selected.attributionBasis==='RECONSTRUCTED'?' Этот состав рассчитан по FIFO.':''}</p>
       {selected.fromComposition&&selected.toComposition?<>
         <p>После этого шага {name(selected.from)}: всего {fmt(selected.fromComposition.reduce((n,a)=>n+a.amountSun,0))} — {composition(selected.fromComposition)}.</p>
         <p>После этого шага {name(selected.to)}: всего {fmt(selected.toComposition.reduce((n,a)=>n+a.amountSun,0))} — {composition(selected.toComposition)}.</p>
-        <small>Это расчётный состав после выбранного шага полного плана. Подтверждённое текущее владение показано выше.</small>
+        <small>Это расчётный состав игрового баланса после выбранного шага. Для предыстории с отметкой FIFO применяется правило очереди поступлений; для SMART — сохранённый учёт. Личный резерв Sun в этот состав не входит.</small>
       </>:<small>Это фактический перевод из предыстории. Состав балансов после него здесь не восстанавливается; связь со SMART обозначает начало нового учёта.</small>}
       <small>Исходное время плана: {when(selected.plannedAt)}; сохранённое окно: {when(selected.scheduledAt)}.{selected.confirmedAt?` Подтверждение в блоке: ${when(selected.confirmedAt)}.`:selected.reportSection==='PREHISTORY'?` Запись подтверждения: ${when(selected.updatedAt)}.`:''}</small>
       {selected.txId&&<p className="full-address">TX: {selected.txId}</p>}{selected.bandwidthUsed!==null&&<small>Bandwidth всего перевода: {selected.bandwidthUsed}; стоимость по долям не распределяется.</small>}</section>}

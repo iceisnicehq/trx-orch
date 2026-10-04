@@ -4,7 +4,8 @@ import type {OwnedTransfer} from './ownership.js';
 
 export type FlowNode={id:string;type:'holding'|'transfer'|'checkpoint';wallet:string;amountSun:number;nativeSun?:number;
   day:number;sequence?:number;status:string;rank:number;section?:'PREHISTORY'|'CAMPAIGN';
-  toWallet?:string;mode?:string;at?:string};
+  toWallet?:string;mode?:string;at?:string;checkpointTitle?:string;
+  attributionBasis?:'RECORDED'|'RECONSTRUCTED';attributionMethod?:'RECORDED'|'FIFO'};
 export type FlowEdge={id:string;from:string;to:string;amountSun:number;status:string;section?:'PREHISTORY'|'CAMPAIGN'};
 /** Actual branching DAG: a partial departure leaves a holding branch;
  * receipt at a holder with this owner's funds merges its two predecessors.

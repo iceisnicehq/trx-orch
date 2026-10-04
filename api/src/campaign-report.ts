@@ -85,7 +85,7 @@ function makeOwnerReport(address:string,campaign:ReportCampaign,rows:ReportRow[]
 export async function includeReportPrehistory(db:PrismaClient,report:ReturnType<typeof makeOwnerReport>,beforeSequence?:number){
   const boundary=beforeSequence??(await db.engineState.findUniqueOrThrow({where:{id:1},select:{nextSequence:true}})).nextSequence;
   const prehistory=await loadPrehistory(db,report.address,boundary);
-  return {...report,prehistory,flow:prependPrehistory(report.address,prehistory.events,report.flow)};
+  return {...report,prehistory,flow:prependPrehistory(report.address,prehistory,report.flow)};
 }
 function draftCampaign(v:PlanVariant,loaded=loadVariant(v)){
   const {members,plan}=loaded;
@@ -117,12 +117,15 @@ export function reportCsv(report:NonNullable<Awaited<ReturnType<typeof ownerRepo
   const header=['campaign_id','stake_owner_address','campaign_day','sequence','kind','status','planned_utc','scheduled_utc','scheduled_msk',
     'confirmed_utc','from_address','to_address','owner_amount_sun','owner_amount_trx','native_amount_sun','native_amount_trx',
     'packet_ownership','from_game_balance_after_sun','to_game_balance_after_sun','from_wallet_ownership_after','to_wallet_ownership_after','bandwidth_whole_transaction','tx_id','timing_mode',
-    'report_section','attribution_basis','transfer_mode','source_campaign_id','recorded_confirmation_utc','execution_msk','execution_time_basis'];
+    'report_section','attribution_basis','transfer_mode','source_campaign_id','recorded_confirmation_utc','execution_msk','execution_time_basis',
+    'attribution_method','history_period_id','history_complete','history_initial_stake_sun'];
   const history=(report.prehistory?.events??[]).map(t=>[report.campaign.id,report.address,'',t.sequence,t.kind,t.status,
     date(t.plannedAt),date(t.scheduledAt),msk(t.scheduledAt),date(t.confirmedAt),t.from,t.to,
     t.ownerSun,t.ownerSun===null?'':(t.ownerSun/TARGET).toFixed(6),t.amountSun,(t.amountSun/TARGET).toFixed(6),
-    t.attributionBasis==='RECORDED'?compose(t.allocations):'','','','','',t.bandwidthUsed,t.txId,'',
-    'PREHISTORY',t.attributionBasis,t.legacyMode,t.campaignId,date(t.updatedAt),msk(t.confirmedAt??t.updatedAt),t.confirmedAt?'BLOCK':'RECORD']);
+    compose(t.allocations),t.fromComposition.reduce((n,a)=>n+a.amountSun,0),t.toComposition.reduce((n,a)=>n+a.amountSun,0),
+    compose(t.fromComposition),compose(t.toComposition),t.bandwidthUsed,t.txId,'',
+    'PREHISTORY',t.attributionBasis,t.legacyMode,t.campaignId,date(t.updatedAt),msk(t.confirmedAt??t.updatedAt),t.confirmedAt?'BLOCK':'RECORD',
+    t.attributionMethod,t.periodId,report.prehistory!.complete,TARGET]);
   const rows=report.events.map(t=>[report.campaign.id,report.address,t.campaignDay,t.sequence,t.kind,t.status,
     date(t.plannedAt),date(t.scheduledAt),msk(t.scheduledAt),date(t.confirmedAt),t.from,t.to,t.ownerSun,
     (t.ownerSun/TARGET).toFixed(6),t.amountSun,(t.amountSun/TARGET).toFixed(6),compose(t.allocations),
@@ -131,6 +134,7 @@ export function reportCsv(report:NonNullable<Awaited<ReturnType<typeof ownerRepo
     'CAMPAIGN','RECORDED',t.kind==='MIX'?'SMART':t.kind,report.campaign.variantId?'':report.campaign.id,
     t.status==='CONFIRMED'?date(t.updatedAt??t.confirmedAt):'',
     t.status==='CONFIRMED'&&(t.confirmedAt||t.updatedAt)?msk((t.confirmedAt??t.updatedAt)!):'',
-    t.status==='CONFIRMED'?(t.confirmedAt?'BLOCK':t.updatedAt?'RECORD':'UNKNOWN'):'']);
+    t.status==='CONFIRMED'?(t.confirmedAt?'BLOCK':t.updatedAt?'RECORD':'UNKNOWN'):'',
+    'RECORDED','','','']);
   return '\uFEFF'+[header,...history,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n')+'\r\n';
 }

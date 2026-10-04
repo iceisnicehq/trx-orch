@@ -5,7 +5,7 @@ import {execFileSync} from 'node:child_process';
 import {join} from 'node:path';
 import {createDatabase} from './database.js';
 import {ownerReport,reportCsv,variantOwnerReport,includeReportPrehistory} from './campaign-report.js';
-import {historicalModes} from './report-prehistory.js';
+import {historicalModes,loadPrehistory} from './report-prehistory.js';
 import {buildCampaignPlan} from './campaign-plan.js';
 import {saveVariant} from './plan-variants.js';
 
@@ -96,58 +96,68 @@ test('historical mode comes from the queue audit, including missing-mode fallbac
   strictEqual(historicalModes([{id:1,event:'QUEUED',detail:'1 TRX A → B',transferId:'x'}]).get('x'),'LEGACY');
 });
 
-test('optional prehistory includes peer hops and Rebalance, excludes unrelated and unconfirmed transfers, and never changes the live plan',async()=>{
+test('personal prehistory follows only positive owner shares, including peer hops, without changing the live plan',async()=>{
   const f=await fixture();
   try{
     const before={transfers:await f.db.transfer.findMany({orderBy:{sequence:'asc'},include:{allocations:true}}),
       state:await f.db.engineState.findUniqueOrThrow({where:{id:1}}),audit:await f.db.audit.count()};
     const plain=await ownerReport(f.db,'A');ok(plain);strictEqual(plain.prehistory,null);
     const report=await ownerReport(f.db,'A',undefined,{includePrehistory:true});ok(report?.prehistory);
-    deepStrictEqual(report.prehistory.events.map(t=>t.sequence),[1,2,3,4,5,6,7,13,14,15,16]);
-    strictEqual(report.prehistory.events.find(t=>t.sequence===2)!.from,'B','Keep peer-to-peer history beyond the origin address');
+    deepStrictEqual(report.prehistory.events.map(t=>t.sequence),[1,4,5,14,16]);
+    strictEqual(report.prehistory.events.find(t=>t.sequence===5)!.from,'B','Keep peer-to-peer hops carrying this share beyond the origin address');
     strictEqual(report.prehistory.events.find(t=>t.sequence===1)!.legacyMode,'RANDOM');
     strictEqual(report.prehistory.events.find(t=>t.sequence===5)!.legacyMode,'LIST');
-    strictEqual(report.prehistory.events.filter(t=>t.kind==='REBALANCE').length,2);
-    strictEqual(report.prehistory.unrecordedCount,7);
-    ok(report.prehistory.events.slice(0,7).every(t=>t.ownerSun===null&&t.fromComposition===null&&t.toComposition===null));
+    strictEqual(report.prehistory.events.filter(t=>t.kind==='REBALANCE').length,0,'Rebalances carrying other owners are not personal history');
+    strictEqual(report.prehistory.reconstructedCount,3);
+    strictEqual(report.prehistory.recordedCount,2);
+    strictEqual(report.prehistory.method,'FIFO');strictEqual(report.prehistory.scope,'PERSONAL_ATTRIBUTION');
+    ok(report.prehistory.complete);
+    ok(report.prehistory.events.every(t=>t.ownerSun>0&&t.fromComposition&&t.toComposition));
+    strictEqual(report.prehistory.events.find(t=>t.sequence===5)!.ownerSun,74301,'My share can be smaller than the native one-TRX transfer');
     strictEqual(report.prehistory.events.find(t=>t.sequence===14)!.ownerSun,125000,'Existing frozen allocations are retained');
-    strictEqual(report.prehistory.events.find(t=>t.sequence===13)!.ownerSun,0,'A recorded zero share differs from an unknown share');
+    ok(!report.prehistory.events.some(t=>t.sequence===13),'A saved zero share is also excluded');
     deepStrictEqual(report.events,plain.events);deepStrictEqual(report.positions,plain.positions);deepStrictEqual(report.finalPositions,plain.finalPositions);
     strictEqual(report.shapeSignature,plain.shapeSignature);strictEqual(report.flow.splits,plain.flow.splits);strictEqual(report.flow.merges,plain.flow.merges);
     const ranks=new Map(report.flow.nodes.map(n=>[n.id,n.rank]));
     strictEqual(ranks.size,report.flow.nodes.length,'Context IDs cannot collide with SMART IDs');
     for(const edge of report.flow.edges)ok(ranks.get(edge.from)!<ranks.get(edge.to)!,'Every arrow points forward');
     ok(report.flow.edges.filter(e=>e.status==='CONTEXT').every(e=>e.amountSun===null));
-    ok(report.flow.nodes.filter(n=>n.section==='PREHISTORY'&&n.type==='holding').every(n=>n.amountSun===null));
-    strictEqual(report.flow.nodes.filter(n=>n.type==='checkpoint').length,1,'The bridge is a checkpoint, not a synthetic transaction');
+    ok(report.flow.nodes.filter(n=>n.section==='PREHISTORY'&&n.type==='holding').every(n=>n.amountSun>0&&n.amountSun<=1000000));
+    strictEqual(report.flow.nodes.filter(n=>n.type==='checkpoint').length,2,'Both new SMART attribution periods have honest, non-transfer checkpoints');
+    deepStrictEqual(report.flow.nodes.filter(n=>n.section==='PREHISTORY'&&n.type==='transfer').map(n=>n.sequence),[1,4,5,14,16]);
     const after={transfers:await f.db.transfer.findMany({orderBy:{sequence:'asc'},include:{allocations:true}}),
       state:await f.db.engineState.findUniqueOrThrow({where:{id:1}}),audit:await f.db.audit.count()};
     deepStrictEqual(after,before);ok(!JSON.stringify(report).includes('signedJson'));ok(!JSON.stringify(report).includes('privateKey'));
   }finally{await f.close();}
 });
 
-test('CSV prehistory is optional and preserves every decimal Sun, full route, receipt and unknown field',async()=>{
+test('personal CSV distinguishes exact native receipts from computed owner shares, and preserves every Sun',async()=>{
   const f=await fixture();
   try{
     const plain=await ownerReport(f.db,'A');ok(plain);
     const report=await ownerReport(f.db,'A',undefined,{includePrehistory:true});ok(report);
     const without=csvRows(reportCsv(plain)),withHistory=csvRows(reportCsv(report));
     strictEqual(without.length,3);ok(without.every(row=>row.report_section==='CAMPAIGN'));
-    strictEqual(withHistory.length,14);
+    strictEqual(withHistory.length,8);
     const first=withHistory[0];strictEqual(first.native_amount_sun,'121535');strictEqual(first.native_amount_trx,'0.121535');
-    strictEqual(first.owner_amount_sun,'');strictEqual(first.owner_amount_trx,'');strictEqual(first.packet_ownership,'');
-    strictEqual(first.from_game_balance_after_sun,'');strictEqual(first.from_wallet_ownership_after,'');
-    strictEqual(first.attribution_basis,'UNRECORDED');strictEqual(first.transfer_mode,'RANDOM');strictEqual(first.tx_id,'tx-old-1');
+    strictEqual(first.owner_amount_sun,'121535');strictEqual(first.owner_amount_trx,'0.121535');strictEqual(first.packet_ownership,'A: 0.121535 TRX');
+    strictEqual(first.from_game_balance_after_sun,'878465');strictEqual(first.from_wallet_ownership_after,'A: 0.878465 TRX');
+    strictEqual(first.attribution_basis,'RECONSTRUCTED');strictEqual(first.attribution_method,'FIFO');
+    strictEqual(first.history_initial_stake_sun,'1000000');strictEqual(first.history_complete,'true');
+    ok(first.history_period_id);strictEqual(first.transfer_mode,'RANDOM');strictEqual(first.tx_id,'tx-old-1');
     strictEqual(first.from_address,'A');strictEqual(first.to_address,'B');strictEqual(first.bandwidth_whole_transaction,'267');
-    const missing=withHistory.find(row=>row.sequence==='3')!;
+    const cReport=await ownerReport(f.db,'C',undefined,{includePrehistory:true});ok(cReport);
+    const cRows=csvRows(reportCsv(cReport));
+    const missing=cRows.find(row=>row.sequence==='3')!;
     strictEqual(missing.confirmed_utc,'');strictEqual(missing.bandwidth_whole_transaction,'');ok(missing.recorded_confirmation_utc);
     strictEqual(missing.execution_time_basis,'RECORD');ok(missing.execution_msk.includes('MSK'));
     ok(missing.recorded_confirmation_utc!==missing.scheduled_utc,'A planned date must not be presented as actual confirmation');
     strictEqual(first.execution_time_basis,'BLOCK');
-    const list=withHistory.find(row=>row.sequence==='5')!;strictEqual(list.native_amount_trx,'1.000000');strictEqual(list.transfer_mode,'LIST');
-    const balancing=withHistory.find(row=>row.sequence==='6')!;strictEqual(balancing.transfer_mode,'REBALANCE');strictEqual(balancing.native_amount_sun,'605594');
+    const list=withHistory.find(row=>row.sequence==='5')!;strictEqual(list.native_amount_trx,'1.000000');strictEqual(list.transfer_mode,'LIST');strictEqual(list.owner_amount_trx,'0.074301');
+    const balancing=cRows.find(row=>row.sequence==='7')!;strictEqual(balancing.transfer_mode,'REBALANCE');strictEqual(balancing.native_amount_sun,'452766');strictEqual(balancing.owner_amount_sun,'378465');
     const older=withHistory.find(row=>row.sequence==='14')!;strictEqual(older.attribution_basis,'RECORDED');strictEqual(older.owner_amount_sun,'125000');strictEqual(older.source_campaign_id,'previous');
     deepStrictEqual(withHistory.filter(row=>row.report_section==='CAMPAIGN'),without);
+    ok(withHistory.every(row=>Number(row.owner_amount_sun)>0));
   }finally{await f.close();}
 });
 
@@ -159,7 +169,7 @@ test('archived reports stop at their own start and newly funded wallets get no f
     const current=await ownerReport(f.db,'A','current',{includePrehistory:true});ok(current?.prehistory);
     ok(current.prehistory.events.every(t=>t.sequence<100));
     const previous=await ownerReport(f.db,'A','previous',{includePrehistory:true});ok(previous?.prehistory);
-    deepStrictEqual(previous.prehistory.events.map(t=>t.sequence),[1,2,3,4,5,6,7]);
+    deepStrictEqual(previous.prehistory.events.map(t=>t.sequence),[1,4,5]);
     const plan=buildCampaignPlan([{address:'F',ordinal:5},{address:'E',ordinal:4}],'fresh',at);
     const variant=await saveVariant(f.db,[{address:'F',ordinal:5},{address:'E',ordinal:4}],plan,at,new Date(at.getTime()+42*86_400_000));
     const draft=variantOwnerReport(variant,'F');ok(draft);
@@ -179,5 +189,38 @@ test('saved-plan previews can include prior receipts without creating or copying
     ok(report.prehistory.events.length>0);ok(report.events.every(t=>t.status==='DRAFT'));
     ok(csvRows(reportCsv(report)).some(t=>t.report_section==='PREHISTORY'));
     deepStrictEqual(report.events,draft.events);deepStrictEqual(await f.db.transfer.findMany({orderBy:{sequence:'asc'}}),before);
+  }finally{await f.close();}
+});
+
+test('the cache reuses historical replay across personal reads and invalidates after confirmed journal changes',async()=>{
+  const f=await fixture();
+  try{
+    const first=await loadPrehistory(f.db,'A',100),again=await loadPrehistory(f.db,'A',100);
+    strictEqual(first.events[0].allocations,again.events[0].allocations,'Use the same cached immutable replay');
+    const c=await loadPrehistory(f.db,'C',100);
+    ok(c.events.some(t=>t.kind==='REBALANCE'));ok(!first.events.some(t=>t.kind==='REBALANCE'));
+    await f.db.transfer.update({where:{id:'old-1'},data:{amountSun:121536,updatedAt:new Date(at.getTime()+7*86400000)}});
+    const changed=await loadPrehistory(f.db,'A',100);
+    strictEqual(changed.events[0].ownerSun,121536);
+    ok(changed.events[0].allocations!==first.events[0].allocations);
+    await f.db.transfer.update({where:{id:'old-1'},data:{status:'CANCELLED'}});
+    const removed=await loadPrehistory(f.db,'A',100);
+    ok(!removed.events.some(t=>t.sequence===1));
+  }finally{await f.close();}
+});
+
+test('an incomplete old journal yields a marked partial personal report without changing the current SMART ledger',async()=>{
+  const f=await fixture();
+  try{
+    const plain=await ownerReport(f.db,'A');ok(plain);
+    await f.db.transfer.update({where:{id:'old-4'},data:{amountSun:2000000}});
+    const report=await ownerReport(f.db,'A',undefined,{includePrehistory:true});ok(report?.prehistory);
+    strictEqual(report.prehistory.complete,false);
+    strictEqual(report.prehistory.issues[0].sequence,4);
+    ok(!report.prehistory.events.some(t=>t.sequence===4||t.sequence===5));
+    ok(report.prehistory.events.some(t=>t.sequence===14),'Later recorded SMART attribution remains usable');
+    deepStrictEqual(report.events,plain.events);deepStrictEqual(report.positions,plain.positions);
+    strictEqual((await f.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'CAMPAIGN');
+    ok(csvRows(reportCsv(report)).filter(t=>t.report_section==='PREHISTORY').every(t=>t.history_complete==='false'));
   }finally{await f.close();}
 });
