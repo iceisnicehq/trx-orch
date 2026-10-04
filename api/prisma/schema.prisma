@@ -35,6 +35,9 @@ model Transfer {
   confirmedAt DateTime? // block timestamp, not the later time receipt polling completed
   pacingAfterId String? // confirmed predecessor used for the persisted random gap
   pacingDelayMs Int?
+  resourceReadyAt DateTime? // adaptive MIX: first live check that met the required free quota
+  resourceCheckAt DateTime? // durable, bounded next live resource probe; never a send permission
+  resourceRequired Int? // larger signed transaction requirement discovered during preflight
   approvalSource String? // MANUAL or AUTO; disabling Auto revokes only unsent AUTO approvals
   campaignId String?
   campaignDay Int?
@@ -81,6 +84,8 @@ model Campaign {
   mixingDays Int
   totalDays Int
   executionStartedAt DateTime? // irreversible preparation lock, including failed signing/broadcast retries
+  timingMode String @default("DAILY") // DAILY or BANDWIDTH; routes and allocations stay frozen
+  timingUpdatedAt DateTime? // latest resource-based forecast, not an execution guarantee
   returnReason String?
   payAfterReturn Boolean @default(false)
   createdAt DateTime @default(now())

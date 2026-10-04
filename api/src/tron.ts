@@ -1,11 +1,12 @@
 import {TronWeb} from 'tronweb';
 import type {PrismaClient,Wallet} from '@prisma/client';
 import {MODE, type Config} from './config.js';
-import {bufferedReadyAt,MIN_FREE_BANDWIDTH,RECOVERY_WINDOW_MS,type ForecastSpend} from './recovery.js';
+import {bufferedReadyAt,MIN_FREE_BANDWIDTH,RECOVERY_WINDOW_MS,RECOVERY_BUFFER_MS,type ForecastSpend} from './recovery.js';
 
 export type Receipt = {found:boolean; success:boolean; feeSun:number; bandwidthUsed:number|null; confirmedAt:Date|null};
-export class BandwidthWait extends Error {constructor(message:string,public nextCheckAt:Date){super(message);}}
+export class BandwidthWait extends Error {constructor(message:string,public nextCheckAt:Date,public requiredBandwidth=MIN_FREE_BANDWIDTH){super(message);}}
 export type BandwidthSnapshot={available:number;limit:number;observedAt:number};
+export type BandwidthPolicy={minimum:number;bufferMs:number};
 export class TronService {
   private tron:TronWeb;
   private keys=new Map<string,string>();
@@ -101,25 +102,27 @@ export class TronService {
     }
     return spends;
   }
-  private async wait(address:string,snapshot:BandwidthSnapshot,required:number,stage:string){
-    if(snapshot.limit<MIN_FREE_BANDWIDTH)throw Error(`Free Bandwidth limit ${snapshot.limit} is below the configured ${MIN_FREE_BANDWIDTH} safety floor`);
-    const target=Math.max(MIN_FREE_BANDWIDTH,required);
+  private async wait(address:string,snapshot:BandwidthSnapshot,required:number,stage:string,policy?:BandwidthPolicy){
+    const floor=Math.max(MIN_FREE_BANDWIDTH,policy?.minimum??MIN_FREE_BANDWIDTH);
+    if(snapshot.limit<floor)throw Error(`Free Bandwidth limit ${snapshot.limit} is below the configured ${floor} safety floor`);
+    const target=Math.max(floor,required),buffer=policy?.bufferMs??RECOVERY_BUFFER_MS;
     if(snapshot.limit<target)throw Error(`Free Bandwidth limit ${snapshot.limit} cannot cover the signed transaction's ${target} point requirement`);
     const spends=await this.recentBandwidthSpends(address);
     const now=Date.now();
-    const next=bufferedReadyAt(snapshot.limit,snapshot.available,snapshot.observedAt,now,target,spends);
+    const next=bufferedReadyAt(snapshot.limit,snapshot.available,snapshot.observedAt,now,target,spends,buffer);
     const nextCheckAt=new Date(next??now+6*60*60_000);
     const recent=spends.filter(s=>s.at<=snapshot.observedAt&&s.at+RECOVERY_WINDOW_MS>snapshot.observedAt);
     const last=recent.reduce<ForecastSpend|null>((a,b)=>!a||b.at>a.at?b:a,null);
     const basis=last?`last confirmed spend ${last.points} at ${new Date(last.at).toISOString()} (${(last.points/24).toFixed(3)} points/hour nominal)`:'no recent receipt; conservative recovery estimate';
-    return new BandwidthWait(`${stage}: ${snapshot.available} free, ${target} required; ${basis}; estimated check ${nextCheckAt.toISOString()} (threshold plus one-hour buffer)`,nextCheckAt);
+    return new BandwidthWait(`${stage}: ${snapshot.available} free, ${target} required; ${basis}; estimated check ${nextCheckAt.toISOString()} (${buffer===0?'live resource check; no hourly buffer':'threshold plus one-hour buffer'})`,nextCheckAt,target);
   }
-  async prepare(from:string,to:string,amountSun:number,beforeSign?:()=>Promise<void>):Promise<{txId:string;signedJson:string;bytes:number}>{
+  async prepare(from:string,to:string,amountSun:number,beforeSign?:()=>Promise<void>,policy?:BandwidthPolicy):Promise<{txId:string;signedJson:string;bytes:number}>{
     if(!Number.isSafeInteger(amountSun)||amountSun<=0)throw Error('Invalid amount');
     if(!await this.active(to))throw Error('Recipient is not activated; transfer could incur a fee');
     // Check BEFORE building, then again using the signed transaction's exact size.
     const before=await this.bandwidthSnapshot(from);
-    if(before.available<MIN_FREE_BANDWIDTH)throw await this.wait(from,before,MIN_FREE_BANDWIDTH,'Before building');
+    const floor=Math.max(MIN_FREE_BANDWIDTH,policy?.minimum??MIN_FREE_BANDWIDTH);
+    if(before.available<floor)throw await this.wait(from,before,floor,'Before building',policy);
     if(MODE==='mock'){await beforeSign?.();return {txId:`mock-${Date.now()}-${Math.random().toString(36).slice(2)}`,signedJson:'{}',bytes:276};}
     const unsigned=await this.rpc(()=>this.tron.transactionBuilder.sendTrx(to,amountSun,from));
     if(unsigned.raw_data.contract.length!==1||unsigned.raw_data.contract[0].type!=='TransferContract')throw Error('Unexpected contract type');
@@ -132,12 +135,12 @@ export class TronService {
     // TRON's documented estimation includes protobuf wrapper, signatures and result bytes.
     const bytes=signed.raw_data_hex.length/2+3+64+67*signed.signature.length+16;
     const after=await this.bandwidthSnapshot(from);
-    if(after.available<Math.max(MIN_FREE_BANDWIDTH,bytes))throw await this.wait(from,after,bytes,'Signed native transfer');
+    if(after.available<Math.max(floor,bytes))throw await this.wait(from,after,bytes,'Signed native transfer',policy);
     return {txId:signed.txID,signedJson:JSON.stringify(signed),bytes};
   }
-  async broadcast(from:string,to:string,amountSun:number,txId:string,signedJson:string,bytes:number):Promise<void>{
+  async broadcast(from:string,to:string,amountSun:number,txId:string,signedJson:string,bytes:number,policy?:BandwidthPolicy):Promise<void>{
     const snapshot=await this.bandwidthSnapshot(from);
-    if(snapshot.available<Math.max(MIN_FREE_BANDWIDTH,bytes))throw await this.wait(from,snapshot,bytes,'Before broadcast');
+    if(snapshot.available<Math.max(MIN_FREE_BANDWIDTH,policy?.minimum??0,bytes))throw await this.wait(from,snapshot,bytes,'Before broadcast',policy);
     if(!await this.active(to))throw Error('Recipient activation changed');
     if(MODE==='mock'){
       const sender=await this.db.wallet.findUniqueOrThrow({where:{address:from}});
@@ -157,13 +160,13 @@ export class TronService {
     if(result.code==='DUP_TRANSACTION_ERROR')return;
     if(!result.result)throw Error(`Broadcast not accepted: ${String(result.code??'unknown')}`);
   }
-  async rebroadcastPersisted(from:string,to:string,amountSun:number,txId:string,signedJson:string):Promise<boolean>{
+  async rebroadcastPersisted(from:string,to:string,amountSun:number,txId:string,signedJson:string,policy?:BandwidthPolicy):Promise<boolean>{
     if(MODE==='mock')return true;
     const signed=JSON.parse(signedJson);
     if(signed.txID!==txId||signed.raw_data?.contract?.length!==1||signed.raw_data.contract[0].type!=='TransferContract'||signed.signature?.length!==1)throw Error('Persisted signed native transfer failed validation');
     if(!Number.isSafeInteger(signed.raw_data.expiration)||signed.raw_data.expiration<=Date.now()+5_000)return false;
     const bytes=signed.raw_data_hex.length/2+3+64+67*signed.signature.length+16;
-    await this.broadcast(from,to,amountSun,txId,signedJson,bytes);
+    await this.broadcast(from,to,amountSun,txId,signedJson,bytes,policy);
     return true;
   }
   async receipt(txId:string):Promise<Receipt>{

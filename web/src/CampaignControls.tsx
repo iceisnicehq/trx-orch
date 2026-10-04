@@ -2,6 +2,7 @@ import {useState} from 'react';
 
 export type Position={ownerAddress:string;holderAddress:string;amountSun:number};
 export type Campaign={id:string;draft?:boolean;variantId?:string;status:string;payAfterReturn:boolean;startedAt:string;deadlineAt:string;mixingDays:number;totalDays:number;
+  timingMode?:'DAILY'|'BANDWIDTH';timingUpdatedAt?:string|null;
   total:number;confirmed:number;mixingTransfers:number;forecastEndsAt:string|null;deadlineRisk:boolean;positions:Position[];
   members:{address:string;ordinal:number;profile:{type:string;releaseDay:number;quarterDay:number;eighthDay:number|null}}[]};
 export type Ask=(title:string,path:string,body?:object,description?:string)=>void;
@@ -42,6 +43,15 @@ export function CampaignControls({phase,selectedCount,teacherAddress,campaign,as
       <small>По {campaign.mixingDays} MIX-отправок с каждого кошелька; возвраты считаются отдельно.</small>
       <small>Дедлайн: {msk(campaign.deadlineAt)}</small>{campaign.forecastEndsAt&&<small>Текущий прогноз завершения: {msk(campaign.forecastEndsAt)}</small>}
       {campaign.deadlineRisk&&<strong className="campaign-warning">Запас до дедлайна уменьшился. Движок готовит досрочный возврат; в ручном режиме нужны одобрения.</strong>}
+    </div>}
+    {campaign&&!campaign.draft&&<div className="timing-control"><span className="eyebrow">РАСПИСАНИЕ MIX</span>
+      <h3>{campaign.timingMode==='BANDWIDTH'?'Ускорение по Bandwidth включено':'Суточное расписание'}</h3>
+      <p>{campaign.timingMode==='BANDWIDTH'?
+        'Следующий MIX ждёт одобрения, подтверждения предыдущего шага и минимум 407 бесплатных Bandwidth. Затем выдерживается сохранённая случайная пауза: 1–2 минуты при полной квоте, 5–10 минут при частичной. Порядок переводов сохраняется.':
+        'Можно пересчитать время уже запущенного плана по восстановлению ресурсов. Маршруты, суммы, доли и одобрения сохранятся; исполнение может закончиться раньше исходной даты.'}</p>
+      {campaign.timingMode!=='BANDWIDTH'&&<button type="button" className="plan-action" disabled={phase!=='CAMPAIGN'} onClick={()=>ask('Ускорить расписание MIX','/api/admin/campaign/accelerate',{},
+        'Оставшиеся MIX-переводы получат новое время по фактическому Bandwidth. Порог — минимум 407, дополнительного часового ожидания и ограничения 24 часа между MIX нет. Уже одобренные переводы могут отправиться раньше прежних дат. Маршруты, суммы, порядок и учёт долей сохраняются. После каждого подтверждения прогноз обновляется. Возврат долей завершится паузой; выплаты учителю разрешает только End Game.')}>Ускорить по Bandwidth</button>}
+      {campaign.timingMode==='BANDWIDTH'&&<small className="amount-help">День плана обозначает этап алгоритма. Новые даты — прогноз; перед отправкой ресурс проверяется заново. Возвраты сохраняют суточные интервалы отправителя.{campaign.timingUpdatedAt?` Прогноз обновлён: ${msk(campaign.timingUpdatedAt)}.`:''}</small>}
     </div>}
     <div className="teacher-setting"><span className="eyebrow">АДРЕС УЧИТЕЛЯ</span><p className="full-address">{teacherAddress}</p>
       <label htmlFor="teacher-address">Новый полный адрес</label><input id="teacher-address" value={teacher} onChange={e=>setTeacher(e.target.value)} placeholder="T…" autoComplete="off" spellCheck={false}/>

@@ -71,6 +71,7 @@
 .campaign-inputs label,.teacher-setting label{display:block;color:#a1b9c5;font-size:11px;line-height:1.5}
 .campaign-inputs input,.teacher-setting input{display:block;width:100%;min-width:0;margin-top:6px}
 .teacher-setting{border-top:1px solid #293e4d;padding:17px 0;margin-top:18px}
+.timing-control{border-top:1px solid #293e4d;padding-top:17px;margin-top:18px}.timing-control .plan-action{width:100%}.timing-control p{margin:8px 0 12px}
 .full-address{overflow-wrap:anywhere;font:11px ui-monospace,monospace;color:#adcbd8;line-height:1.65}
 .campaign-progress{display:flex;flex-direction:column;gap:7px;border:1px solid #37676b;border-radius:8px;background:#143138;padding:12px;font-size:12px}
 .campaign-progress small{color:#a2c3c6;line-height:1.5}.campaign-warning{color:#ffdca4!important;font-size:12px;line-height:1.5}
@@ -79,6 +80,13 @@
 .stake-report{overflow:auto;min-height:100px;padding-right:5px}
 .report-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:8px 0}
 .report-download{display:inline-block;text-decoration:none;color:#d2f7c0;background:#234336;border:1px solid #73a775;border-radius:6px;padding:9px 12px;font-size:12px;font-weight:700}
+.report-history-options{display:grid;gap:10px;margin:12px 0;padding:12px;border:1px solid #35585c;border-radius:8px;background:#142d37}
+.report-history-toggle{display:flex;align-items:flex-start;gap:10px;font-size:13px;color:#c7dedb;cursor:pointer}
+.report-history-toggle input{width:17px;height:17px;flex:0 0 17px;margin:2px 0 0;accent-color:#b9f35a;padding:0}
+.report-history-toggle small{display:block;color:#91afb9;font-size:11px;line-height:1.5;margin-top:3px}
+.report-prehistory-notice{padding:12px;border:1px solid #85673b;border-radius:8px;background:#342d22;color:#e9d3a7;font-size:12px;line-height:1.6;margin:12px 0}
+.report-prehistory-notice p{margin:6px 0}.report-prehistory-notice small{display:block;color:#cfb586}
+.report-history-badge{color:#edbd6e}
 .report-facts{display:flex;gap:10px;flex-wrap:wrap;color:#b8dccd;font-size:12px;margin:14px 0}
 .report-facts span{border:1px solid #35585c;border-radius:6px;padding:8px;background:#18353b}
 .owner-positions{display:flex;flex-wrap:wrap;gap:9px;color:#a9d5d3;font-size:12px;margin:12px 0}

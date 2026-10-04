@@ -25,7 +25,7 @@ export function projectedFree(limit:number,available:number,observedAt:number,at
 // After the most recent modeled spend, recovery is monotonic. Find when the
 // forecast crosses the floor, then add an hour if recovery was needed.
 export function bufferedReadyAt(limit:number,available:number,observedAt:number,after:number,
-  target=MIN_FREE_BANDWIDTH,spends:ForecastSpend[]=[]):number|null{
+  target=MIN_FREE_BANDWIDTH,spends:ForecastSpend[]=[],bufferMs=RECOVERY_BUFFER_MS):number|null{
   if(limit<target)return null;
   const lastSpend=spends.length?Math.max(...spends.map(s=>s.at)):observedAt;
   const start=Math.max(observedAt,lastSpend);
@@ -37,5 +37,5 @@ export function bufferedReadyAt(limit:number,available:number,observedAt:number,
     if(projectedFree(limit,available,observedAt,mid,spends)>=target)high=mid;
     else low=mid;
   }
-  return Math.max(after,high+RECOVERY_BUFFER_MS);
+  return Math.max(after,high+bufferMs);
 }

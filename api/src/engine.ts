@@ -3,11 +3,12 @@ import {TronWeb} from 'tronweb';
 import type {EngineState,Prisma,PrismaClient,Transfer,Wallet} from '@prisma/client';
 import {MODE,TARGET,type Config} from './config.js';
 import {settleTargets,settlementPlan} from './settlement.js';
-import {BandwidthWait,TronService} from './tron.js';
+import {BandwidthWait,TronService,type BandwidthSnapshot,type BandwidthPolicy} from './tron.js';
 import {bufferedReadyAt,MIN_FREE_BANDWIDTH} from './recovery.js';
 import {DAY,type CampaignPlan} from './campaign-plan.js';
 import {applyConfirmedOwnership,verifyOwnership,attributedReturns,OwnershipError} from './ownership.js';
 import {buildBalancedPlan,loadVariant,saveVariant,swapPlan,serializePlan,preparationPermission} from './plan-variants.js';
+import {ADAPTIVE_BANDWIDTH,RESOURCE_PROBE_MS,adaptiveMixForecast,adaptiveReturnForecast,chooseGap,gapRange,type TimingWallet} from './adaptive-timing.js';
 
 export class HttpError extends Error {constructor(public code:number,message:string){super(message);}}
 const MIN_MIX_GAP_MS=60*60_000;
@@ -29,14 +30,33 @@ function amountList(json:string):number[]{
 export class EngineService {
   private busy=false;
   private timer?:NodeJS.Timeout;
+  private wakeTimer?:NodeJS.Timeout;
+  private wakeAt=0;
+  private stopped=false;
+  private timingRevision='';
+  private timingResources?:{campaignId:string;wallets:Map<string,TimingWallet>};
   constructor(private db:PrismaClient, private tron:TronService, private config:Config,private campaignOnly=false){}
-  stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
+  stop(){this.stopped=true;if(this.timer)clearInterval(this.timer);if(this.wakeTimer)clearTimeout(this.wakeTimer);this.timer=undefined;this.wakeTimer=undefined;this.wakeAt=0;}
+  private wake(at:Date){
+    if(this.stopped)return;
+    const when=Math.max(Date.now()+1000,at.getTime());
+    if(this.wakeTimer&&this.wakeAt<=when)return;
+    if(this.wakeTimer)clearTimeout(this.wakeTimer);
+    this.wakeAt=when;
+    this.wakeTimer=setTimeout(()=>{
+      this.wakeTimer=undefined;this.wakeAt=0;
+      if(this.busy){this.wake(new Date(Date.now()+5000));return;}
+      this.tick().catch(e=>console.error('Timing tick:',e.message));
+    },Math.min(when-Date.now(),2_147_000_000));
+    this.wakeTimer.unref();
+  }
   private async audit(event:string,detail:string,transferId?:string){await this.db.audit.create({data:{event,detail,transferId}});}
   async withLock<T>(fn:()=>Promise<T>):Promise<T>{
     if(this.busy)throw new HttpError(409,'Engine is busy; retry shortly');
     this.busy=true;try{return await fn();}finally{this.busy=false;}
   }
   async init(){
+    this.stopped=false;
     await this.db.$queryRawUnsafe('PRAGMA journal_mode=WAL');
     await this.db.$queryRawUnsafe('PRAGMA busy_timeout=5000');
     const check=await this.db.$queryRawUnsafe<{quick_check:string}[]>('PRAGMA quick_check');
@@ -781,7 +801,9 @@ export class EngineService {
       // txID for recovery; never sign a replacement based on a missing receipt.
       if(t.status==='SUBMITTING'&&t.signedJson&&Date.now()-t.updatedAt.getTime()>30_000){
         try{
-          const retried=await this.tron.rebroadcastPersisted(t.from,t.to,t.amountSun,t.txId!,t.signedJson);
+          const c=t.campaignId&&t.kind==='MIX'?await this.db.campaign.findUnique({where:{id:t.campaignId},select:{timingMode:true}}):null;
+          const policy=c?.timingMode==='BANDWIDTH'?{minimum:ADAPTIVE_BANDWIDTH,bufferMs:0}:undefined;
+          const retried=await this.tron.rebroadcastPersisted(t.from,t.to,t.amountSun,t.txId!,t.signedJson,policy);
           if(retried){
             await this.db.$transaction(async tx=>{
               await tx.transfer.update({where:{id:t.id},data:{status:'SUBMITTED',note:'Same signed transaction retried; awaiting chain confirmation'}});
@@ -823,6 +845,116 @@ export class EngineService {
     this.tron.invalidatePublicSnapshot();
   }
   async tick(){return this.withLock(()=>this.tickBody());}
+  async accelerateCampaign(){return this.withLock(async()=>{
+    const s=await this.state();
+    if(s.phase!=='CAMPAIGN'||!s.activeCampaignId)throw new HttpError(409,'Acceleration requires an active mixing campaign');
+    const c=await this.db.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId}});
+    if(c.timingMode==='BANDWIDTH')return {ok:true,timingMode:c.timingMode,alreadyEnabled:true};
+    const flight=await this.db.transfer.findFirst({where:{campaignId:c.id,status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}});
+    if(flight?.status==='UNKNOWN')throw new HttpError(409,'Resolve the ambiguous transaction before changing timing');
+    if(flight){
+      await this.db.$transaction(async tx=>{
+        await tx.campaign.update({where:{id:c.id},data:{timingMode:'BANDWIDTH'}});
+        await tx.audit.create({data:{event:'CAMPAIGN_TIMING_ENABLED',detail:`Campaign ${c.id}: resource-based MIX timing enabled; frozen routes, allocations and approvals retained; waiting for persisted tx ${flight.txId}`}});
+      });
+      this.timingRevision='';return {ok:true,timingMode:'BANDWIDTH',pendingReceipt:true};
+    }
+    await this.refreshAdaptiveTimeline(c,undefined,true);
+    await this.tickBody();
+    return {ok:true,timingMode:'BANDWIDTH',pendingReceipt:false};
+  });}
+  private async refreshAdaptiveTimeline(c:{id:string;startedAt:Date},observed?:{address:string;snapshot:BandwidthSnapshot},enable=false){
+    const [pending,closing,previous]=await Promise.all([
+      this.db.transfer.findMany({where:{campaignId:c.id,kind:'MIX',status:{in:['PLANNED','APPROVED','PAUSED']}},orderBy:{sequence:'asc'}}),
+      this.db.transfer.findMany({where:{campaignId:c.id,kind:'RETURN',status:{in:['PLANNED','APPROVED','PAUSED']}},orderBy:{sequence:'asc'}}),
+      this.db.transfer.findFirst({where:{status:'CONFIRMED'},orderBy:{sequence:'desc'},select:{id:true,confirmedAt:true,updatedAt:true}})
+    ]);
+    if(!pending.length){if(enable)throw new HttpError(409,'There are no remaining MIX transfers');return;}
+    if(pending.some(t=>t.txId!==null||t.signedJson!==null))throw new OwnershipError('A pending MIX has a persisted signature; resolve its original transaction before rescheduling');
+    const wallets=new Map<string,TimingWallet>();
+    await Promise.all([...new Set(pending.map(t=>t.from))].map(async address=>{
+      // Rechecking a blocked head only needs that sender's fresh resource
+      // observation. Other snapshots are forecast inputs, never permission to
+      // send; refresh all senders after a receipt, activation or restart.
+      const cached=observed&&this.timingResources?.campaignId===c.id?this.timingResources.wallets.get(address):undefined;
+      if(cached&&observed&&observed.address!==address){wallets.set(address,cached);return;}
+      const [snapshot,spends,last]=await Promise.all([
+        observed?.address===address?Promise.resolve(observed.snapshot):this.tron.bandwidthSnapshot(address),
+        this.tron.recentBandwidthSpends(address),
+        this.db.transfer.findFirst({where:{from:address,status:'CONFIRMED'},orderBy:{sequence:'desc'},select:{bandwidthUsed:true,confirmedAt:true,updatedAt:true}})
+      ]);
+      if(snapshot.limit<ADAPTIVE_BANDWIDTH)throw new HttpError(400,`Wallet ${address} has a free quota below ${ADAPTIVE_BANDWIDTH}`);
+      const known=last?.bandwidthUsed;
+      wallets.set(address,{snapshot,spends,cost:known&&known>0?Math.min(snapshot.limit,known):400,
+        lastConfirmedAt:last?(last.confirmedAt??last.updatedAt).getTime():null});
+    }));
+    const now=Date.now(),previousAt=previous?(previous.confirmedAt??previous.updatedAt).getTime():c.startedAt.getTime();
+    const forecast=adaptiveMixForecast(pending,wallets,now,previousAt,previous?.id??null);
+    const returns=adaptiveReturnForecast(closing,forecast.mixEndsAt,forecast.lastSenderAt,now);
+    await this.db.$transaction(async tx=>{
+      for(const slot of forecast.times){
+        const old=pending.find(t=>t.id===slot.id)!;
+        if(old.scheduledAt.getTime()===slot.scheduledAt.getTime()&&old.pacingDelayMs===slot.pacingDelayMs&&old.pacingAfterId===slot.pacingAfterId)continue;
+        await tx.transfer.updateMany({where:{id:slot.id,txId:null,status:{in:['PLANNED','APPROVED','PAUSED']}},data:{
+          scheduledAt:slot.scheduledAt,pacingDelayMs:slot.pacingDelayMs,pacingAfterId:slot.pacingAfterId}});
+      }
+      for(const slot of returns){
+        if(closing.find(t=>t.id===slot.id)!.scheduledAt.getTime()===slot.scheduledAt.getTime())continue;
+        await tx.transfer.updateMany({where:{id:slot.id,txId:null,status:{in:['PLANNED','APPROVED','PAUSED']}},data:{scheduledAt:slot.scheduledAt}});
+      }
+      await tx.campaign.update({where:{id:c.id},data:{timingUpdatedAt:new Date(now),...(enable?{timingMode:'BANDWIDTH'}:{})}});
+      if(enable)await tx.audit.create({data:{event:'CAMPAIGN_TIMING_ENABLED',detail:`Campaign ${c.id}: remaining MIX times recalculated in original sequence; ${ADAPTIVE_BANDWIDTH} free Bandwidth floor, no hourly buffer; saved random gaps; routes, amounts, allocations, original plannedAt and approvals retained; return ends in pause without teacher payouts`}});
+    },{timeout:30_000});
+    this.timingResources={campaignId:c.id,wallets};
+    this.timingRevision=`${c.id}:${pending[0].id}:${previous?.id??'start'}`;
+  }
+  private async waitForAdaptiveResource(next:Transfer,snapshot:BandwidthSnapshot,required:number){
+    const spends=await this.tron.recentBandwidthSpends(next.from),now=Date.now();
+    const estimated=bufferedReadyAt(snapshot.limit,snapshot.available,snapshot.observedAt,now,required,spends,0);
+    const checkAt=new Date(Math.max(now+15_000,Math.min(estimated??now+RESOURCE_PROBE_MS,now+RESOURCE_PROBE_MS)));
+    await this.db.transfer.update({where:{id:next.id},data:{resourceReadyAt:null,resourceCheckAt:checkAt,resourceRequired:required,
+      note:`Waiting for free Bandwidth: ${snapshot.available}/${required}; live check ${checkAt.toISOString()}`}});
+    const c=await this.db.campaign.findUniqueOrThrow({where:{id:next.campaignId!}});
+    try{await this.refreshAdaptiveTimeline(c,{address:next.from,snapshot});}
+    catch(e){if(e instanceof OwnershipError)throw e;this.timingRevision='';console.error('Adaptive forecast:',e instanceof Error?e.message:String(e));}
+    this.wake(checkAt);
+    await this.db.engineState.update({where:{id:1},data:{status:`Waiting for free Bandwidth: ${next.from}, ${snapshot.available}/${required}; next live check ${checkAt.toISOString()}; later MIX transfers stay behind this step`}});
+  }
+  private async adaptivePacing(next:Transfer){
+    let snapshot:BandwidthSnapshot;
+    try{snapshot=await this.tron.bandwidthSnapshot(next.from);}
+    catch(e){
+      const retryAt=new Date(Date.now()+60_000);
+      await this.db.transfer.update({where:{id:next.id},data:{resourceCheckAt:retryAt}});
+      await this.db.engineState.update({where:{id:1},data:{status:`Resource node unavailable for MIX #${next.sequence}; waiting for a fresh quota check`}});
+      this.wake(retryAt);return true;
+    }
+    const required=Math.max(ADAPTIVE_BANDWIDTH,next.resourceRequired??0);
+    if(snapshot.available<required){await this.waitForAdaptiveResource(next,snapshot,required);return true;}
+    let readyAt=next.resourceReadyAt,delay=next.pacingDelayMs;
+    if(!readyAt){
+      readyAt=new Date(Date.now());
+      const [min,max]=gapRange(snapshot.available>=snapshot.limit);
+      if(delay===null||delay<min||delay>max)delay=chooseGap(snapshot.available>=snapshot.limit);
+      await this.db.transfer.update({where:{id:next.id},data:{resourceReadyAt:readyAt,resourceCheckAt:null,pacingDelayMs:delay,
+        note:'Live free quota ready; saved random interval before the next ordered MIX transfer'}});
+      const c=await this.db.campaign.findUniqueOrThrow({where:{id:next.campaignId!}});
+      try{await this.refreshAdaptiveTimeline(c,{address:next.from,snapshot});}
+      catch(e){
+        if(e instanceof OwnershipError)throw e;
+        this.timingRevision='';
+        await this.db.transfer.update({where:{id:next.id},data:{scheduledAt:new Date(readyAt.getTime()+delay!)}});
+        console.error('Adaptive forecast:',e instanceof Error?e.message:String(e));
+      }
+    }
+    const until=new Date(readyAt.getTime()+delay!);
+    if(until.getTime()>Date.now()){
+      this.wake(until);
+      await this.db.engineState.update({where:{id:1},data:{status:`Saved random interval before MIX #${next.sequence}: ${until.toISOString()}; approval and live resource checks required`}});
+      return true;
+    }
+    return false;
+  }
   private async createCampaignReturnMap(s:EngineState){
     const c=await this.db.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId!},include:{members:true}});
     const positions=await verifyOwnership(this.db,c.id),steps=attributedReturns(positions),wallets=await this.joined();
@@ -868,6 +1000,21 @@ export class EngineService {
     if(s.phase==='CAMPAIGN_RESTORED')return;
     if(s.phase==='CAMPAIGN_RETURN_REQUESTED'){await this.createCampaignReturnMap(s);s=await this.state();}
     if(s.phase==='CAMPAIGN'){
+      if(c.timingMode==='BANDWIDTH'){
+        const [head,previous]=await Promise.all([
+          this.db.transfer.findFirst({where:{campaignId:c.id,kind:'MIX',status:{in:['PLANNED','APPROVED','PAUSED']}},orderBy:{sequence:'asc'},select:{id:true}}),
+          this.db.transfer.findFirst({where:{status:'CONFIRMED'},orderBy:{sequence:'desc'},select:{id:true}})
+        ]);
+        if(head&&this.timingRevision!==`${c.id}:${head.id}:${previous?.id??'start'}`){
+          try{await this.refreshAdaptiveTimeline(c);}
+          catch(e){
+            if(e instanceof OwnershipError)throw e;
+            await this.db.engineState.update({where:{id:1},data:{status:'Waiting for resource observations to refresh the ordered MIX schedule'}});
+            console.error('Adaptive forecast:',e instanceof Error?e.message:String(e));
+            this.wake(new Date(Date.now()+60_000));return;
+          }
+        }
+      }
       const mix=await this.db.transfer.findFirst({where:{campaignId:c.id,kind:'MIX',status:{in:['PLANNED','APPROVED','PAUSED']}},orderBy:{sequence:'asc'}});
       if(!mix){
         await this.db.$transaction(async tx=>{
@@ -921,14 +1068,26 @@ export class EngineService {
     if(next.status==='PLANNED'){
       await this.db.engineState.update({where:{id:1},data:{status:`Awaiting approval: day ${next.campaignDay}, ${next.kind} #${next.sequence}`}});return;
     }
-    if(next.scheduledAt.getTime()>Date.now()){
+    const adaptive=kind==='MIX'&&c.timingMode==='BANDWIDTH';
+    if(adaptive&&next.status!=='APPROVED'){
+      await this.db.engineState.update({where:{id:1},data:{status:`MIX #${next.sequence} is ${next.status}; later transfers cannot overtake it`}});return;
+    }
+    if(adaptive&&next.resourceCheckAt&&next.resourceCheckAt.getTime()>Date.now()){
+      this.wake(next.resourceCheckAt);
+      await this.db.engineState.update({where:{id:1},data:{status:`Waiting for the next live resource check for MIX #${next.sequence}: ${next.resourceCheckAt.toISOString()}`}});return;
+    }
+    if(adaptive&&next.resourceReadyAt&&next.scheduledAt.getTime()>Date.now()){
+      this.wake(next.scheduledAt);
+      await this.db.engineState.update({where:{id:1},data:{status:`Saved random interval before MIX #${next.sequence}: ${next.scheduledAt.toISOString()}`}});return;
+    }
+    if(!adaptive&&next.scheduledAt.getTime()>Date.now()){
       await this.db.engineState.update({where:{id:1},data:{status:`Next ${next.kind} #${next.sequence}: ${next.scheduledAt.toISOString()}; waiting for its time and live resource check`}});return;
     }
     for(const a of next.allocations){
       const position=await this.db.ownershipBalance.findUnique({where:{campaignId_ownerAddress_holderAddress:{campaignId:c.id,ownerAddress:a.ownerAddress,holderAddress:next.from}}});
       if(!position||position.amountSun<a.amountSun)throw new OwnershipError(`Planned #${next.sequence} cannot spend ${a.ownerAddress}'s attributed share`);
     }
-    await this.executeTransfer(next,b);
+    await this.executeTransfer(next,b,adaptive?{minimum:ADAPTIVE_BANDWIDTH,bufferMs:0}:undefined);
   }
 
   private async paceTransfer(next:Transfer){
@@ -946,10 +1105,11 @@ export class EngineService {
     const until=new Date((previous.confirmedAt??previous.updatedAt).getTime()+delay!);
     if(until.getTime()<=Date.now())return false;
     await this.delayTransfer(next,until,`Random gap after #${previous.sequence}: ${Math.ceil(delay!/1000)} seconds; resource check still required`);
+    this.wake(until);
     await this.db.engineState.update({where:{id:1},data:{status:`Random interval before #${next.sequence}: ${until.toISOString()}`}});
     return true;
   }
-  private async executeTransfer(next:Transfer,b:PoolBalance[]){
+  private async executeTransfer(next:Transfer,b:PoolBalance[],policy?:BandwidthPolicy){
     if(next.campaignId){
       const [allocations,members]=await Promise.all([
         this.db.allocation.findMany({where:{transferId:next.id}}),this.db.campaignMember.findMany({where:{campaignId:next.campaignId}})
@@ -964,7 +1124,7 @@ export class EngineService {
       if(next.kind==='PAYOUT'&&(allocations.length!==1||allocations[0].ownerAddress!==next.from||next.amountSun!==TARGET))
         throw new OwnershipError('Teacher payout cannot spend another participant\'s attributed stake');
     }
-    if(next.campaignId&&["MIX","RETURN"].includes(next.kind)){
+    if(next.campaignId&&["MIX","RETURN"].includes(next.kind)&&!policy){
       const last=await this.db.transfer.findFirst({where:{from:next.from,status:"CONFIRMED"},orderBy:{sequence:"desc"}});
       if(last&&(last.confirmedAt??last.updatedAt).getTime()+DAY>Date.now()){
         const until=new Date((last.confirmedAt??last.updatedAt).getTime()+DAY);
@@ -981,13 +1141,14 @@ export class EngineService {
         await this.fatal(`Insufficient game balance for transfer #${next.sequence}; extra Sun is reserved`);return;
       }
       if(next.kind==='PAYOUT'&&sender.sun!==senderWallet.entryBalanceSun){await this.fatal(`Payout wallet ${next.from} holds ${sender.sun}, expected ${senderWallet.entryBalanceSun} including reserved Sun`);return;}
-      if(await this.paceTransfer(next))return;
+      if(policy?await this.adaptivePacing(next):await this.paceTransfer(next))return;
       await this.db.engineState.update({where:{id:1},data:{status:`Preflight ${next.kind.toLowerCase()} #${next.sequence} from ${next.from}`}});
       let prepared;
       try{prepared=await this.tron.prepare(next.from,next.to,next.amountSun,async()=>{
         if(next.campaignId)await this.db.campaign.updateMany({where:{id:next.campaignId,executionStartedAt:null},data:{executionStartedAt:new Date(Date.now())}});
-      });}catch(e){
+      },policy);}catch(e){
         if(e instanceof BandwidthWait){
+          if(policy){await this.waitForAdaptiveResource(next,await this.tron.bandwidthSnapshot(next.from),Math.max(ADAPTIVE_BANDWIDTH,e.requiredBandwidth));return;}
           await this.delayTransfer(next,e.nextCheckAt,`Bandwidth: ${e.message}`);
           await this.db.engineState.update({where:{id:1},data:{status:`Waiting for bandwidth: ${next.from}; ${e.message}`}});return;
         }throw e;
@@ -995,14 +1156,16 @@ export class EngineService {
       // Persist tx ID BEFORE broadcast. Any crash/error from this point pauses, never rebuilds.
       await this.db.transfer.update({where:{id:next.id},data:{status:'SUBMITTING',txId:prepared.txId,signedJson:prepared.signedJson,note:`Preflight ${prepared.bytes} bytes`}});
       try{
-        await this.tron.broadcast(next.from,next.to,next.amountSun,prepared.txId,prepared.signedJson,prepared.bytes);
+        await this.tron.broadcast(next.from,next.to,next.amountSun,prepared.txId,prepared.signedJson,prepared.bytes,policy);
         await this.db.transfer.update({where:{id:next.id},data:{status:'SUBMITTED'}});
         await this.audit('SUBMITTED',`${next.kind} #${next.sequence} tx ${prepared.txId}`,next.id);
         await this.db.engineState.update({where:{id:1},data:{status:`Waiting for receipt: ${next.kind.toLowerCase()} #${next.sequence}`}});
+        if(policy)this.wake(new Date(Date.now()+10_000));
       }catch(e){
         if(e instanceof BandwidthWait){
           // This typed error is thrown before any network broadcast call.
           await this.db.transfer.update({where:{id:next.id},data:{status:'APPROVED',txId:null,signedJson:null}});
+          if(policy){await this.waitForAdaptiveResource(next,await this.tron.bandwidthSnapshot(next.from),Math.max(ADAPTIVE_BANDWIDTH,e.requiredBandwidth));return;}
           await this.delayTransfer(next,e.nextCheckAt,`Bandwidth changed before broadcast: ${e.message}`);
           await this.db.engineState.update({where:{id:1},data:{status:`Waiting for bandwidth before transfer #${next.sequence}: ${e.message}`}});
           return;
@@ -1036,7 +1199,11 @@ export class EngineService {
       if(active){if(active.status==='UNKNOWN'){await this.fatal('Ambiguous transaction requires manual investigation');return;}
         await this.resolveInFlight(active);
         if((await this.state()).phase==='HALTED')return;
-        if((await this.db.transfer.findUniqueOrThrow({where:{id:active.id}})).status!=='CONFIRMED')return;
+        if((await this.db.transfer.findUniqueOrThrow({where:{id:active.id}})).status!=='CONFIRMED'){
+          if(active.campaignId&&active.kind==='MIX'&&(await this.db.campaign.findUnique({where:{id:active.campaignId},select:{timingMode:true}}))?.timingMode==='BANDWIDTH')
+            this.wake(new Date(Date.now()+10_000));
+          return;
+        }
         justConfirmed=true;
       }
       let b=await this.reconcile();if(!b)return;

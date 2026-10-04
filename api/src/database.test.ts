@@ -75,5 +75,16 @@ test('17-wallet dashboard/report reads, engine verification and Telegram ingesti
     strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0);
     strictEqual((await f.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'CAMPAIGN');
     strictEqual((await verifyOwnership(f.db,state.activeCampaignId!)).length,17);
+    const routes=await f.db.transfer.findMany({orderBy:{sequence:'asc'},select:{id:true,sequence:true,from:true,to:true,amountSun:true,plannedAt:true,allocations:true}});
+    const adaptive=await Promise.allSettled([engine.accelerateCampaign(),worker.runOnce(),
+      ...Array.from({length:24},(_,i)=>Promise.all([
+        campaignSummary(f.db),variantList(f.db),ownerReport(f.db,config.wallets[i%17].address,undefined,{includePrehistory:i%2===0}),verifyOwnership(f.db,state.activeCampaignId!)
+      ]))]);
+    ok(adaptive.every(o=>o.status==='fulfilled'),adaptive.filter(o=>o.status==='rejected').map(o=>String(o.reason)).join('\n'));
+    await worker.runOnce();
+    strictEqual(await f.db.telegramDelivery.count(),263,'The timing change is logged once without skipping earlier events');
+    strictEqual((await f.db.campaign.findUniqueOrThrow({where:{id:state.activeCampaignId!}})).timingMode,'BANDWIDTH');
+    deepStrictEqual(await f.db.transfer.findMany({orderBy:{sequence:'asc'},select:{id:true,sequence:true,from:true,to:true,amountSun:true,plannedAt:true,allocations:true}}),routes);
+    strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0,'Timing forecasts cannot create approvals or broadcasts');
   }finally{engine.stop();globalThis.fetch=originalFetch;await f.close();}
 });

@@ -4,6 +4,7 @@ import {replayOwnership,type OwnedTransfer} from './ownership.js';
 import type {Profile} from './campaign-plan.js';
 import {loadVariant,planRows} from './plan-variants.js';
 import type {PlanVariant} from '@prisma/client';
+import {loadPrehistory,prependPrehistory} from './report-prehistory.js';
 
 export {ownershipFlow,shapeSignature} from './ownership-flow.js';
 import {ownershipFlow,shapeSignature} from './ownership-flow.js';
@@ -26,24 +27,27 @@ export async function campaignSummary(db:PrismaClient){
     mixingTransfers:rows.filter(t=>t.kind==='MIX'&&t.status!=='CANCELLED').length,
     forecastEndsAt,deadlineRisk:forecastEndsAt!==null&&forecastEndsAt.getTime()>c.deadlineAt.getTime()-4*86_400_000};
 }
-export async function ownerReport(db:PrismaClient,address:string,campaignId?:string){
+export async function ownerReport(db:PrismaClient,address:string,campaignId?:string,options:{includePrehistory?:boolean}={}){
   const s=await db.engineState.findUniqueOrThrow({where:{id:1}});
   if(!campaignId&&s.phase==='PREPARING'&&s.selectedPlanVariantId){
     const v=await db.planVariant.findUniqueOrThrow({where:{id:s.selectedPlanVariantId}});
-    return variantOwnerReport(v,address);
+    const report=variantOwnerReport(v,address);
+    return report&&options.includePrehistory?includeReportPrehistory(db,report,s.nextSequence):report;
   }
   const id=campaignId??s.activeCampaignId;if(!id)return null;
   const campaign=await db.campaign.findUnique({where:{id},include:{members:{orderBy:{ordinal:'asc'}}}});
   if(!campaign||!campaign.members.some(m=>m.address===address))return null;
   const rows=await db.transfer.findMany({where:{campaignId:id},orderBy:{sequence:'asc'},
     select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,campaignDay:true,scheduledAt:true,
-      plannedAt:true,confirmedAt:true,bandwidthUsed:true,txId:true,note:true,allocations:{select:{ownerAddress:true,amountSun:true}}}});
-  return makeOwnerReport(address,campaign,rows);
+      plannedAt:true,confirmedAt:true,updatedAt:true,bandwidthUsed:true,txId:true,note:true,allocations:{select:{ownerAddress:true,amountSun:true}}}});
+  const report=makeOwnerReport(address,campaign,rows);
+  return options.includePrehistory?includeReportPrehistory(db,report,rows.reduce((min,t)=>Math.min(min,t.sequence),s.nextSequence)):report;
 }
 
-type ReportRow=OwnedTransfer & {campaignDay:number|null;scheduledAt:Date;plannedAt:Date|null;confirmedAt:Date|null;
+type ReportRow=OwnedTransfer & {campaignDay:number|null;scheduledAt:Date;plannedAt:Date|null;confirmedAt:Date|null;updatedAt?:Date;
   bandwidthUsed:number|null;txId:string|null;note:string|null};
 type ReportCampaign={id:string;status:string;startedAt:Date;deadlineAt:Date;totalDays:number;mixingDays:number;
+  timingMode?:string;
   variantId?:string;members:{address:string;ordinal:number;profileJson:string}[]};
 function makeOwnerReport(address:string,campaign:ReportCampaign,rows:ReportRow[]){
     const active=rows.filter(t=>t.status!=='CANCELLED');
@@ -72,10 +76,16 @@ function makeOwnerReport(address:string,campaign:ReportCampaign,rows:ReportRow[]
     }
     const member=campaign.members.find(m=>m.address===address)!;
     return {address,campaign:{...campaign,members:campaign.members.map(m=>({address:m.address,ordinal:m.ordinal}))},
+      prehistory:null as Awaited<ReturnType<typeof loadPrehistory>>|null,
       profile:JSON.parse(member.profileJson) as Profile,events,cancelled:rows.filter(t=>t.status==='CANCELLED'&&t.allocations.some(a=>a.ownerAddress===address)),
       positions:confirmedPositions.filter(p=>p.ownerAddress===address),finalPositions:plannedPositions.filter(p=>p.ownerAddress===address),
       flow,shapeSignature:shapeSignature(flow),actualSends:active.filter(t=>t.from===address&&t.status==='CONFIRMED').length,
       plannedMixSends:active.filter(t=>t.from===address&&t.kind==='MIX').length};
+}
+export async function includeReportPrehistory(db:PrismaClient,report:ReturnType<typeof makeOwnerReport>,beforeSequence?:number){
+  const boundary=beforeSequence??(await db.engineState.findUniqueOrThrow({where:{id:1},select:{nextSequence:true}})).nextSequence;
+  const prehistory=await loadPrehistory(db,report.address,boundary);
+  return {...report,prehistory,flow:prependPrehistory(report.address,prehistory.events,report.flow)};
 }
 function draftCampaign(v:PlanVariant,loaded=loadVariant(v)){
   const {members,plan}=loaded;
@@ -106,11 +116,21 @@ export function reportCsv(report:NonNullable<Awaited<ReturnType<typeof ownerRepo
   const compose=(a:{ownerAddress:string;amountSun:number}[])=>a.map(p=>`${p.ownerAddress}: ${(p.amountSun/TARGET).toFixed(6)} TRX`).join('; ');
   const header=['campaign_id','stake_owner_address','campaign_day','sequence','kind','status','planned_utc','scheduled_utc','scheduled_msk',
     'confirmed_utc','from_address','to_address','owner_amount_sun','owner_amount_trx','native_amount_sun','native_amount_trx',
-    'packet_ownership','from_game_balance_after_sun','to_game_balance_after_sun','from_wallet_ownership_after','to_wallet_ownership_after','bandwidth_whole_transaction','tx_id'];
+    'packet_ownership','from_game_balance_after_sun','to_game_balance_after_sun','from_wallet_ownership_after','to_wallet_ownership_after','bandwidth_whole_transaction','tx_id','timing_mode',
+    'report_section','attribution_basis','transfer_mode','source_campaign_id','recorded_confirmation_utc','execution_msk','execution_time_basis'];
+  const history=(report.prehistory?.events??[]).map(t=>[report.campaign.id,report.address,'',t.sequence,t.kind,t.status,
+    date(t.plannedAt),date(t.scheduledAt),msk(t.scheduledAt),date(t.confirmedAt),t.from,t.to,
+    t.ownerSun,t.ownerSun===null?'':(t.ownerSun/TARGET).toFixed(6),t.amountSun,(t.amountSun/TARGET).toFixed(6),
+    t.attributionBasis==='RECORDED'?compose(t.allocations):'','','','','',t.bandwidthUsed,t.txId,'',
+    'PREHISTORY',t.attributionBasis,t.legacyMode,t.campaignId,date(t.updatedAt),msk(t.confirmedAt??t.updatedAt),t.confirmedAt?'BLOCK':'RECORD']);
   const rows=report.events.map(t=>[report.campaign.id,report.address,t.campaignDay,t.sequence,t.kind,t.status,
     date(t.plannedAt),date(t.scheduledAt),msk(t.scheduledAt),date(t.confirmedAt),t.from,t.to,t.ownerSun,
     (t.ownerSun/TARGET).toFixed(6),t.amountSun,(t.amountSun/TARGET).toFixed(6),compose(t.allocations),
     t.fromComposition.reduce((n,a)=>n+a.amountSun,0),t.toComposition.reduce((n,a)=>n+a.amountSun,0),
-    compose(t.fromComposition),compose(t.toComposition),t.bandwidthUsed,t.txId]);
-  return '\uFEFF'+[header,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n')+'\r\n';
+    compose(t.fromComposition),compose(t.toComposition),t.bandwidthUsed,t.txId,report.campaign.timingMode??'DAILY',
+    'CAMPAIGN','RECORDED',t.kind==='MIX'?'SMART':t.kind,report.campaign.variantId?'':report.campaign.id,
+    t.status==='CONFIRMED'?date(t.updatedAt??t.confirmedAt):'',
+    t.status==='CONFIRMED'&&(t.confirmedAt||t.updatedAt)?msk((t.confirmedAt??t.updatedAt)!):'',
+    t.status==='CONFIRMED'?(t.confirmedAt?'BLOCK':t.updatedAt?'RECORD':'UNKNOWN'):'']);
+  return '\uFEFF'+[header,...history,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n')+'\r\n';
 }

@@ -9,7 +9,7 @@ import {TronService} from './tron.js';
 import {EngineService,HttpError} from './engine.js';
 import {TelegramService,telegramOptionsFromEnv} from './telegram.js';
 import {nodeHistory} from './node-history.js';
-import {campaignSummary,ownerReport,reportCsv,variantOwnerReport} from './campaign-report.js';
+import {campaignSummary,ownerReport,reportCsv,variantOwnerReport,includeReportPrehistory} from './campaign-report.js';
 import {selectedDraft,variantList} from './plan-variants.js';
 import {approvalQueue} from './queue.js';
 
@@ -80,11 +80,13 @@ app.get('/api/plans',asyncRoute(async(_req,res)=>res.json(await variantList(db))
 app.get('/api/plans/:id/report/:address',asyncRoute(async(req,res)=>{
   const variant=await db.planVariant.findUnique({where:{id:req.params.id}});
   if(!variant)throw new HttpError(404,'Saved plan not found');
-  const report=variantOwnerReport(variant,req.params.address);
-  if(!report)throw new HttpError(404,'Wallet not in this saved plan');
+  const planReport=variantOwnerReport(variant,req.params.address);
+  if(!planReport)throw new HttpError(404,'Wallet not in this saved plan');
+  const includePrehistory=z.enum(['0','1']).parse(req.query.includePrehistory??'0')==='1';
+  const report=includePrehistory?await includeReportPrehistory(db,planReport):planReport;
   if(req.query.format==='csv'){
     res.setHeader('Content-Type','text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition',`attachment; filename="plan-${variant.number}-node-${report.campaign.members.find(m=>m.address===report.address)!.ordinal+1}.csv"`);
+    res.setHeader('Content-Disposition',`attachment; filename="plan-${variant.number}-node-${report.campaign.members.find(m=>m.address===report.address)!.ordinal+1}${includePrehistory?'-with-history':''}.csv"`);
     res.send(reportCsv(report));return;
   }
   res.json(report);
@@ -94,11 +96,12 @@ app.get('/api/campaigns',asyncRoute(async(_req,res)=>res.json(await db.campaign.
 app.get('/api/campaign/return/preview',asyncRoute(async(_req,res)=>res.json(await engine.campaignReturnPreview())));
 app.get('/api/campaign/report/:address',asyncRoute(async(req,res)=>{
   const id=req.query.campaignId===undefined?undefined:z.string().min(1).max(100).parse(req.query.campaignId);
-  const report=await ownerReport(db,req.params.address,id);
+  const includePrehistory=z.enum(['0','1']).parse(req.query.includePrehistory??'0')==='1';
+  const report=await ownerReport(db,req.params.address,id,{includePrehistory});
   if(!report)throw new HttpError(404,'This wallet has no attributed stake in the selected campaign');
   if(req.query.format==='csv'){
     res.setHeader('Content-Type','text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition',`attachment; filename="node-${report.campaign.members.find(m=>m.address===report.address)!.ordinal+1}-${report.campaign.id}.csv"`);
+    res.setHeader('Content-Disposition',`attachment; filename="node-${report.campaign.members.find(m=>m.address===report.address)!.ordinal+1}-${report.campaign.id}${includePrehistory?'-with-history':''}.csv"`);
     res.send(reportCsv(report));return;
   }
   res.json(report);
@@ -140,6 +143,7 @@ app.post('/api/admin/teacher',requirePassword,asyncRoute(async(req,res)=>{
   res.json(await engine.changeTeacher(z.string().trim().parse(req.body.address)));
 }));
 app.post('/api/admin/campaign/return',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.returnCampaign())));
+app.post('/api/admin/campaign/accelerate',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.accelerateCampaign())));
 app.post('/api/admin/replan',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.replan())));
 app.post('/api/admin/rebalance',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.rebalance())));
 app.post('/api/admin/resume',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.resumeExtraReserves())));

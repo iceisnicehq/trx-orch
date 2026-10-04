@@ -300,3 +300,138 @@ for(const [available,min,max] of [[600,60_000,120_000],[500,300_000,600_000]])te
     strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:rows[1].id}})).status,'SUBMITTED');
   }finally{await f.close();}
 });
+
+test('active campaign acceleration keeps routes and approvals, waits for 407 and never bypasses a blocked queue head',async()=>{
+  const f=await fixture(3);
+  try{
+    await f.engine.startCampaign();
+    const original=await f.db.transfer.findMany({where:{campaignId:{not:null}},orderBy:{sequence:'asc'},include:{allocations:true}});
+    const first=original[0],second=original[1];
+    ok(first.from!==second.from);
+    await f.db.transfer.updateMany({where:{id:{in:[first.id,second.id]}},data:{scheduledAt:new Date(f.clock.at+86_400_000)}});
+    await f.engine.approve(first.id);await f.engine.approve(second.id);
+    let available=333;
+    const probes=new Map<string,number>();
+    f.tron.bandwidthSnapshot=async address=>{
+      probes.set(address,(probes.get(address)??0)+1);
+      return {available:address===first.from?available:600,limit:600,observedAt:f.clock.at};
+    };
+    f.tron.recentBandwidthSpends=async address=>address===first.from?[{at:f.clock.at,points:600-available}]:[];
+    await f.engine.accelerateCampaign();
+    strictEqual((await f.db.campaign.findFirstOrThrow()).timingMode,'BANDWIDTH');
+    let head=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    strictEqual(head.status,'APPROVED');strictEqual(head.approvalSource,'MANUAL');
+    strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:second.id}})).status,'APPROVED');
+    strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0,'Ready later sender cannot overtake');
+    ok(head.scheduledAt.getTime()<f.clock.at+12*60*60_000);
+    ok(head.resourceCheckAt!.getTime()<=f.clock.at+5*60_000);
+    const laterProbes=probes.get(second.from);
+    available=406;f.clock.at=head.resourceCheckAt!.getTime()+1000;await f.engine.tick();
+    strictEqual(probes.get(second.from),laterProbes,'A blocked head probe must not poll every later sender again');
+    strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0);
+    head=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    available=407;f.clock.at=head.resourceCheckAt!.getTime()+1000;await f.engine.tick();
+    head=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    ok(head.resourceReadyAt);ok(head.pacingDelayMs!>=300_000&&head.pacingDelayMs!<=600_000);
+    strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0,'Readiness still observes saved random gap');
+    const delay=head.pacingDelayMs,ready=head.resourceReadyAt.getTime(),time=head.scheduledAt.getTime();
+    await f.restart();
+    head=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    strictEqual(head.pacingDelayMs,delay);strictEqual(head.resourceReadyAt!.getTime(),ready);strictEqual(head.scheduledAt.getTime(),time);
+    f.clock.at=time+1000;await f.engine.tick();
+    strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:first.id}})).status,'SUBMITTED');
+    strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:second.id}})).status,'APPROVED','Predecessor must confirm first');
+    const now=await f.db.transfer.findMany({where:{campaignId:{not:null}},orderBy:{sequence:'asc'},include:{allocations:true}});
+    const frozen=(rows:typeof now)=>rows.map(t=>[t.id,t.sequence,t.kind,t.from,t.to,t.amountSun,t.campaignDay,t.plannedAt?.getTime(),t.dependsOnId,t.allocations]);
+    deepStrictEqual(frozen(now),frozen(original));
+    await f.engine.returnCampaign();await drain(f,'CAMPAIGN_RESTORED');
+    strictEqual(await f.db.transfer.count({where:{kind:'PAYOUT'}}),0);
+  }finally{await f.close();}
+});
+
+test('adaptive timing can be enabled during a flight and restored without replacing its transaction',async()=>{
+  const f=await fixture(3);
+  try{
+    await f.engine.startCampaign();
+    const first=await f.db.transfer.findFirstOrThrow({where:{kind:'MIX'},orderBy:{sequence:'asc'}});
+    f.clock.at=first.scheduledAt.getTime()+1000;await f.engine.approve(first.id);
+    const signed=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    strictEqual(signed.status,'SUBMITTED');
+    const result=await f.engine.accelerateCampaign();ok('pendingReceipt' in result&&result.pendingReceipt);
+    const retained=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    strictEqual(retained.txId,signed.txId);strictEqual(retained.signedJson,signed.signedJson);strictEqual(retained.scheduledAt.getTime(),signed.scheduledAt.getTime());
+    await f.restart();
+    strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:first.id}})).status,'CONFIRMED');
+    strictEqual((await f.db.campaign.findFirstOrThrow()).timingMode,'BANDWIDTH');
+    const counts=await f.db.transfer.count();await f.engine.accelerateCampaign();strictEqual(await f.db.transfer.count(),counts);
+    for(const w of f.members)await f.engine.autoApprove(w.address,true);
+    await drain(f,'CAMPAIGN_RESTORED');
+    strictEqual(await f.db.transfer.count({where:{kind:'PAYOUT'}}),0);
+    const {verifyOwnership}=await import('./ownership.js');
+    const c=await f.db.campaign.findFirstOrThrow(),positions=await verifyOwnership(f.db,c.id);
+    ok(positions.every(p=>p.ownerAddress===p.holderAddress&&p.amountSun===1_000_000));
+    ok(f.clock.at<c.startedAt.getTime()+c.totalDays*86_400_000,'Adaptive execution can finish ahead of original calendar');
+    await f.engine.end();await drain(f,'COMPLETE');
+    strictEqual(await f.db.transfer.count({where:{kind:'PAYOUT',status:'CONFIRMED'}}),3);
+  }finally{await f.close();}
+});
+
+test('the adaptive 407 floor is enforced again before building and broadcasting',async()=>{
+  const f=await fixture(2);
+  try{
+    const policy={minimum:407,bufferMs:0},from=f.members[0].address,to=f.members[1].address;
+    f.tron.bandwidthSnapshot=async()=>({available:406,limit:600,observedAt:f.clock.at});
+    let signed=false;
+    await rejects(f.tron.prepare(from,to,500_000,async()=>{signed=true;},policy),/407 required/);
+    strictEqual(signed,false);
+    await rejects(f.tron.broadcast(from,to,500_000,'test','{}',276,policy),/407 required/);
+    f.tron.bandwidthSnapshot=async()=>({available:420,limit:600,observedAt:f.clock.at});
+    await rejects(f.tron.broadcast(from,to,500_000,'test','{}',500,policy),/500 required/);
+    strictEqual((await f.db.wallet.findUniqueOrThrow({where:{address:from}})).balanceSnapshotSun,1_000_001);
+  }finally{await f.close();}
+});
+
+test('resource changes before broadcast retain approval, clear the unsent signature and remember the larger byte requirement',async()=>{
+  const f=await fixture(3);
+  try{
+    const {BandwidthWait}=await import('./tron.js');
+    await f.engine.startCampaign();await f.engine.accelerateCampaign();
+    let first=await f.db.transfer.findFirstOrThrow({where:{kind:'MIX'},orderBy:{sequence:'asc'}});
+    await f.engine.approve(first.id);
+    first=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    const broadcast=f.tron.broadcast.bind(f.tron);
+    f.tron.broadcast=async()=>{throw new BandwidthWait('quota changed before broadcast',new Date(f.clock.at+60_000),500);};
+    f.clock.at=first.scheduledAt.getTime()+1000;await f.engine.tick();
+    first=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    strictEqual(first.status,'APPROVED');strictEqual(first.approvalSource,'MANUAL');strictEqual(first.txId,null);strictEqual(first.signedJson,null);
+    strictEqual(first.resourceRequired,500);strictEqual(first.resourceReadyAt,null);
+    strictEqual((await f.db.wallet.findUniqueOrThrow({where:{address:first.from}})).balanceSnapshotSun,f.members.findIndex(w=>w.address===first.from)+1_000_001);
+    let available=450;
+    f.tron.bandwidthSnapshot=async address=>({available:address===first.from?available:600,limit:600,observedAt:f.clock.at});
+    f.clock.at=first.resourceCheckAt!.getTime()+1000;await f.engine.tick();
+    strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0,'407 cannot override a larger signed byte requirement');
+    first=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    available=600;f.clock.at=first.resourceCheckAt!.getTime()+1000;await f.engine.tick();
+    first=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});
+    f.tron.broadcast=broadcast;f.clock.at=first.scheduledAt.getTime()+1000;await f.engine.tick();
+    strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:first.id}})).status,'SUBMITTED');
+  }finally{await f.close();}
+});
+
+test('an unavailable resource node pauses adaptive forecasting without approvals, broadcasts or a fatal phase',async()=>{
+  const f=await fixture(3);
+  try{
+    await f.engine.startCampaign();await f.engine.accelerateCampaign();
+    const original=await f.db.transfer.findMany({where:{kind:'MIX'},orderBy:{sequence:'asc'}});
+    await f.db.campaign.updateMany({data:{timingUpdatedAt:null}});
+    // A fresh engine has no process-local forecast revision and must query
+    // resources before treating the saved dates as a valid current estimate.
+    const {EngineService}=await import('./engine.js');
+    f.tron.bandwidthSnapshot=async()=>{throw Error('temporary resource RPC outage');};
+    const engine=new EngineService(f.db,f.tron,f.config,true);
+    await engine.init();engine.stop();
+    strictEqual((await f.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'CAMPAIGN');
+    strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0);
+    deepStrictEqual((await f.db.transfer.findMany({where:{kind:'MIX'},orderBy:{sequence:'asc'}})).map(t=>[t.id,t.status]),original.map(t=>[t.id,t.status]));
+  }finally{await f.close();}
+});

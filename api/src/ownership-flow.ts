@@ -2,9 +2,10 @@ import {createHash} from 'node:crypto';
 import {TARGET} from './config.js';
 import type {OwnedTransfer} from './ownership.js';
 
-export type FlowNode={id:string;type:'holding'|'transfer';wallet:string;amountSun:number;nativeSun?:number;
-  day:number;sequence?:number;status:string;rank:number};
-export type FlowEdge={id:string;from:string;to:string;amountSun:number;status:string};
+export type FlowNode={id:string;type:'holding'|'transfer'|'checkpoint';wallet:string;amountSun:number;nativeSun?:number;
+  day:number;sequence?:number;status:string;rank:number;section?:'PREHISTORY'|'CAMPAIGN';
+  toWallet?:string;mode?:string;at?:string};
+export type FlowEdge={id:string;from:string;to:string;amountSun:number;status:string;section?:'PREHISTORY'|'CAMPAIGN'};
 /** Actual branching DAG: a partial departure leaves a holding branch;
  * receipt at a holder with this owner's funds merges its two predecessors.
  * Holding edges are explicitly separate from native transaction nodes. */
@@ -50,4 +51,3 @@ export function shapeSignature(flow:ReturnType<typeof ownershipFlow>){
   for(const n of flow.nodes){const key=`${n.type}:${n.amountSun}:${n.nativeSun??0}`;counters.set(key,(counters.get(key)??0)+1);}
   return createHash('sha256').update(JSON.stringify([flow.splits,flow.merges,[...counters].sort()])).digest('hex');
 }
-
