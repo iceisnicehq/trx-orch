@@ -2,18 +2,19 @@ import express from 'express';
 import helmet from 'helmet';
 import {rateLimit} from 'express-rate-limit';
 import {timingSafeEqual} from 'node:crypto';
-import {PrismaClient} from '@prisma/client';
+import {createDatabase} from './database.js';
 import {z} from 'zod';
 import {loadConfig,MODE,TARGET} from './config.js';
 import {TronService} from './tron.js';
 import {EngineService,HttpError} from './engine.js';
 import {TelegramService,telegramOptionsFromEnv} from './telegram.js';
 import {nodeHistory} from './node-history.js';
-import {campaignSummary,ownerReport,reportCsv} from './campaign-report.js';
+import {campaignSummary,ownerReport,reportCsv,variantOwnerReport} from './campaign-report.js';
+import {selectedDraft,variantList} from './plan-variants.js';
 import {approvalQueue} from './queue.js';
 
 const config=await loadConfig();
-const db=new PrismaClient();
+const db=createDatabase();
 const tron=new TronService(db,config);
 const engine=new EngineService(db,tron,config,true);
 const telegram=new TelegramService(db,telegramOptionsFromEnv());
@@ -42,14 +43,14 @@ app.get('/api/state',asyncRoute(async(_req,res)=>{
   const snapshot=await tron.publicWallets(wallets);
   const balances=wallets.map((w,i)=>({address:w.address,ordinal:w.ordinal,autoApprove:w.autoApprove,mixEnabled:w.mixEnabled,joined:w.joined,
     reserveSun:w.joined?w.entryBalanceSun!-TARGET:Math.max(0,snapshot[i].balanceSun-TARGET),balanceSun:snapshot[i].balanceSun,bandwidth:snapshot[i].bandwidth}));
-  const members=balances.filter(w=>s.phase==='IDLE'?w.mixEnabled:w.joined);
+  const members=balances.filter(w=>['IDLE','PREPARING'].includes(s.phase)?w.mixEnabled:w.joined);
   const reserveSun=members.reduce((n,w)=>n+w.reserveSun,0);
   const rebalanceRows=s.rebalanceFromSequence===null?[]:await db.transfer.findMany({
     where:{kind:'REBALANCE',sequence:{gte:s.rebalanceFromSequence}},select:{status:true}});
   res.json({mode:MODE,phase:s.phase,status:`Status: ${s.status}`,fatalReason:s.fatalReason,teacherAddress:s.teacherAddress,
     expectedPoolSun:members.length*TARGET-(paid._sum.amountSun??0),poolSun:members.reduce((n,w)=>n+w.balanceSun,0)-reserveSun,
     reserveSun,configuredSun:balances.reduce((n,w)=>n+w.balanceSun,0),selectedCount:balances.filter(w=>w.mixEnabled).length,joinedCount:balances.filter(w=>w.joined).length,
-    mixAmountMode:s.mixAmountMode,mixAmountListSun:JSON.parse(s.mixAmountList),mixAmountCursor:s.mixAmountCursor,activeCampaignId:s.activeCampaignId,
+    mixAmountMode:s.mixAmountMode,mixAmountListSun:JSON.parse(s.mixAmountList),mixAmountCursor:s.mixAmountCursor,activeCampaignId:s.activeCampaignId,selectedPlanVariantId:s.selectedPlanVariantId,
     rebalanceTotal:rebalanceRows.length,rebalanceDone:rebalanceRows.filter(r=>r.status==='CONFIRMED').length,
     wallets:balances,updatedAt:s.updatedAt});
 }));
@@ -58,19 +59,35 @@ app.get('/api/graph',asyncRoute(async(_req,res)=>{
     db.transfer.findMany({orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,createdAt:true,txId:true,note:true,bandwidthUsed:true,campaignId:true,campaignDay:true}}),
     db.wallet.findMany({orderBy:{ordinal:'asc'}}),db.engineState.findUniqueOrThrow({where:{id:1}})
   ]);
+  const draft=await selectedDraft(db);
+  const graphRows=[...transfers,...(draft?.rows??[])];
   const oldTeachers=[...new Set(transfers.filter(t=>t.kind==='PAYOUT'&&t.to!==s.teacherAddress).map(t=>t.to))];
   const returning=transfers.find(t=>t.campaignId===s.activeCampaignId&&t.kind==='RETURN'&&t.status!=='CANCELLED');
   res.json({nodes:[...wallets.map(w=>({id:w.address,label:`Node ${w.ordinal+1}`,mixEnabled:w.mixEnabled,joined:w.joined})),{id:s.teacherAddress,label:'Teacher',mixEnabled:false,joined:false},
       ...oldTeachers.map(id=>({id,label:'Teacher (previous)',mixEnabled:false,joined:false}))],
     currentMapFromSequence:s.phase.startsWith('CAMPAIGN_RETURN')?returning?.sequence??null:['REBALANCE_REQUESTED','REBALANCING'].includes(s.phase)?s.rebalanceFromSequence:
       ['END_REQUESTED','SETTLING'].includes(s.phase)?s.settlementFromSequence:null,
-    edges:transfers.filter(t=>t.status!=='CANCELLED')});
+    edges:graphRows.filter(t=>t.status!=='CANCELLED')});
 }));
 app.get('/api/rebalance/preview',asyncRoute(async(_req,res)=>res.json(await engine.rebalancePreview())));
 app.get('/api/recovery/preview',asyncRoute(async(_req,res)=>res.json(await engine.extraRecoveryPreview())));
 app.get('/api/queue',asyncRoute(async(_req,res)=>{
   const rows=await db.transfer.findMany({where:{status:{in:['PLANNED','APPROVED','PAUSED','SUBMITTED','SUBMITTING','UNKNOWN']}},orderBy:{sequence:'asc'},select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,scheduledAt:true,note:true,txId:true,campaignId:true,campaignDay:true}});
-  res.json(approvalQueue(rows));
+  const draft=await selectedDraft(db);
+  res.json(approvalQueue([...rows,...(draft?.rows??[])]));
+}));
+app.get('/api/plans',asyncRoute(async(_req,res)=>res.json(await variantList(db))));
+app.get('/api/plans/:id/report/:address',asyncRoute(async(req,res)=>{
+  const variant=await db.planVariant.findUnique({where:{id:req.params.id}});
+  if(!variant)throw new HttpError(404,'Saved plan not found');
+  const report=variantOwnerReport(variant,req.params.address);
+  if(!report)throw new HttpError(404,'Wallet not in this saved plan');
+  if(req.query.format==='csv'){
+    res.setHeader('Content-Type','text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition',`attachment; filename="plan-${variant.number}-node-${report.campaign.members.find(m=>m.address===report.address)!.ordinal+1}.csv"`);
+    res.send(reportCsv(report));return;
+  }
+  res.json(report);
 }));
 app.get('/api/campaign',asyncRoute(async(_req,res)=>res.json(await campaignSummary(db))));
 app.get('/api/campaigns',asyncRoute(async(_req,res)=>res.json(await db.campaign.findMany({orderBy:{createdAt:'desc'},select:{id:true,status:true,startedAt:true,deadlineAt:true,totalDays:true}}))));
@@ -104,6 +121,16 @@ app.get('/api/logs/:address',asyncRoute(async(req,res)=>{
       ...(status==='CONFIRMED'?{status:'CONFIRMED'}:{})},orderBy:{sequence:'desc'},take:100,skip:page*100,select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,txId:true,note:true,bandwidthUsed:true,confirmedAt:true,scheduledAt:true,updatedAt:true}})
   ]);
   res.json({events,transfers});
+}));
+app.post('/api/admin/plans/generate',requirePassword,asyncRoute(async(req,res)=>{
+  const b=z.object({totalDays:z.number().int().min(18).max(60).optional(),deadlineAt:z.string().datetime({offset:true}).optional()}).parse(req.body);
+  res.json(await engine.generatePlan({totalDays:b.totalDays,deadlineAt:b.deadlineAt?new Date(b.deadlineAt):undefined}));
+}));
+app.post('/api/admin/plans/current',requirePassword,asyncRoute(async(_req,res)=>res.json(await engine.prepareCurrent())));
+app.post('/api/admin/plans/:id/select',requirePassword,asyncRoute(async(req,res)=>res.json(await engine.selectPlan(req.params.id))));
+app.post('/api/admin/plans/:id/swap',requirePassword,asyncRoute(async(req,res)=>{
+  const b=z.object({first:z.string(),second:z.string()}).parse(req.body);
+  res.json(await engine.swapPlans(req.params.id,b.first,b.second));
 }));
 app.post('/api/admin/start',requirePassword,asyncRoute(async(req,res)=>{
   const body=z.object({totalDays:z.number().int().min(18).max(60).optional(),deadlineAt:z.string().datetime({offset:true}).optional()}).parse(req.body);

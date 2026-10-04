@@ -114,18 +114,19 @@ export class TronService {
     const basis=last?`last confirmed spend ${last.points} at ${new Date(last.at).toISOString()} (${(last.points/24).toFixed(3)} points/hour nominal)`:'no recent receipt; conservative recovery estimate';
     return new BandwidthWait(`${stage}: ${snapshot.available} free, ${target} required; ${basis}; estimated check ${nextCheckAt.toISOString()} (threshold plus one-hour buffer)`,nextCheckAt);
   }
-  async prepare(from:string,to:string,amountSun:number):Promise<{txId:string;signedJson:string;bytes:number}>{
+  async prepare(from:string,to:string,amountSun:number,beforeSign?:()=>Promise<void>):Promise<{txId:string;signedJson:string;bytes:number}>{
     if(!Number.isSafeInteger(amountSun)||amountSun<=0)throw Error('Invalid amount');
     if(!await this.active(to))throw Error('Recipient is not activated; transfer could incur a fee');
     // Check BEFORE building, then again using the signed transaction's exact size.
     const before=await this.bandwidthSnapshot(from);
     if(before.available<MIN_FREE_BANDWIDTH)throw await this.wait(from,before,MIN_FREE_BANDWIDTH,'Before building');
-    if(MODE==='mock')return {txId:`mock-${Date.now()}-${Math.random().toString(36).slice(2)}`,signedJson:'{}',bytes:276};
+    if(MODE==='mock'){await beforeSign?.();return {txId:`mock-${Date.now()}-${Math.random().toString(36).slice(2)}`,signedJson:'{}',bytes:276};}
     const unsigned=await this.rpc(()=>this.tron.transactionBuilder.sendTrx(to,amountSun,from));
     if(unsigned.raw_data.contract.length!==1||unsigned.raw_data.contract[0].type!=='TransferContract')throw Error('Unexpected contract type');
     const value=unsigned.raw_data.contract[0].parameter.value;
     if(TronWeb.address.fromHex(value.owner_address)!==from||TronWeb.address.fromHex(value.to_address)!==to||Number(value.amount)!==amountSun)
       throw Error('Node returned a native transfer with a different sender, recipient or amount');
+    await beforeSign?.();
     const signed=await this.tron.trx.sign(unsigned,this.keys.get(from)!);
     if(!signed.signature?.length||signed.signature.length!==1)throw Error('Expected one signature');
     // TRON's documented estimation includes protobuf wrapper, signatures and result bytes.

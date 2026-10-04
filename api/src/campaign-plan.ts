@@ -31,11 +31,13 @@ function granularity(profile:Profile,day:number){
   return profile.eighthDay!==null&&day>=profile.eighthDay?1:2;
 }
 
-/** Integral knapsack: maximize the number of owners carried by a native
- * transfer, then favor less-travelled contributions and new counterparties.
+/** Integral knapsack: favor owners whose event and branching counts lag
+ * behind the mean, then combine contributions and favor new counterparties.
  * The incoming packet always remains a feasible fallback in a daily cycle. */
-function packet(stock:number[],units:number,day:number,profiles:Profile[],moved:number[],
-  visited:Set<number>[],destination:number,rnd:()=>number):number[]|null{
+function packet(stock:number[],units:number,day:number,profiles:Profile[],events:number[],splits:number[],merges:number[],
+  visited:Set<number>[],destination:number,destinationStock:number[],rnd:()=>number):number[]|null{
+  const average=(items:number[])=>items.reduce((a,b)=>a+b,0)/items.length;
+  const meanEvents=average(events),meanSplits=average(splits),meanMerges=average(merges);
   let dp:(null|{score:number;parts:number[]})[]=Array(units+1).fill(null);
   dp[0]={score:0,parts:Array(stock.length).fill(0)};
   for(let owner=0;owner<stock.length;owner++){
@@ -43,8 +45,12 @@ function packet(stock:number[],units:number,day:number,profiles:Profile[],moved:
     const g=granularity(profiles[owner],day);
     for(let used=0;used<=units;used++)if(dp[used]){
       for(let count=g;count<=Math.min(stock[owner],units-used);count+=g){
-        const score=dp[used]!.score+20+count*12/(1+moved[owner]/8)
-          +(visited[owner].has(destination)?0:8)+rnd()*5;
+        // Balance original-stake histories, rather than only sender counts.
+        // Late/coarse owners get priority; overused tiny shares can wait.
+        const score=dp[used]!.score+80+25*(meanEvents-events[owner])
+          +(count<stock[owner]?12+25*(meanSplits-splits[owner]):0)
+          +(destinationStock[owner]>0?8+12*(meanMerges-merges[owner]):0)
+          +(visited[owner].has(destination)?0:3)+rnd()*3;
         if(!next[used+count]||score>next[used+count]!.score){
           const parts=[...dp[used]!.parts];parts[owner]=count;
           next[used+count]={score,parts};
@@ -70,21 +76,22 @@ export function buildCampaignPlan(members:Member[],seed:string,startedAt:Date,to
   const types=shuffle(Array.from({length:n},(_,i)=>(['EIGHTHS','QUARTERS','LATE_QUARTERS'] as const)[i%3]),rnd);
   const integer=(lo:number,hi:number)=>lo+Math.floor(rnd()*(hi-lo+1));
   const profiles:Profile[]=types.map(type=>{
-    const releaseDay=integer(1,Math.max(2,Math.floor(mixingDays*.32)));
+    const releaseDay=integer(1,Math.max(2,Math.min(4,Math.floor(mixingDays*.16))));
     const quarterDay=type==='QUARTERS'?releaseDay:type==='LATE_QUARTERS'?
-      integer(Math.ceil(mixingDays*.58),mixingDays-1):Math.min(mixingDays-2,releaseDay+integer(1,4));
+      integer(Math.ceil(mixingDays*.32),Math.ceil(mixingDays*.55)):Math.min(mixingDays-2,releaseDay+integer(1,4));
     return {type,releaseDay,quarterDay,eighthDay:type==='EIGHTHS'?
-      integer(quarterDay+1,Math.max(quarterDay+1,mixingDays-2)):null};
+      integer(quarterDay+1,Math.max(quarterDay+1,Math.ceil(mixingDays*.7))):null};
   });
   const firstOwner=integer(0,n-1);
   profiles[firstOwner].releaseDay=1;
   if(profiles[firstOwner].type==='QUARTERS')profiles[firstOwner].quarterDay=1;
   const stock:number[][]=Array.from({length:n},(_,holder)=>Array.from({length:n},(_,owner)=>holder===owner?8:0));
-  const moved=Array(n).fill(0),visited=Array.from({length:n},(_,i)=>new Set([i]));
+  const events=Array(n).fill(0),splits=Array(n).fill(0),merges=Array(n).fill(0),visited=Array.from({length:n},(_,i)=>new Set([i]));
   const steps:PlanStep[]=[];
   for(let day=1;day<=mixingDays;day++){
     const all=Array.from({length:n},(_,i)=>i);
-    const eligible=shuffle(all.filter(h=>[2,4,6].some(q=>packet(stock[h],q,day,profiles,moved,visited,h,rnd)!==null)),rnd);
+    const sizes=day<5?[4,6]:[4,6,8];
+    const eligible=shuffle(all.filter(h=>sizes.some(q=>packet(stock[h],q,day,profiles,events,splits,merges,visited,h,stock[h],rnd)!==null)),rnd);
     if(!eligible.length)throw Error('No feasible packet at the start of a round');
     // Several changing cycles can have different native amounts on the same
     // day. Each cycle has an eligible anchor and at least two wallets.
@@ -96,22 +103,27 @@ export function buildCampaignPlan(members:Member[],seed:string,startedAt:Date,to
     const cycles:PlanStep[][]=[];
     for(const group of groups){
       let order=shuffle(group,rnd),units=4,first:number[]|null=null;
-      outer:for(const size of shuffle([4,4,6,6,2],rnd))for(let i=0;i<order.length;i++){
+      outer:for(const size of shuffle(day<5?[4,6,6]:[4,6,6,8,8],rnd))for(let i=0;i<order.length;i++){
         const rotated=[...order.slice(i),...order.slice(0,i)];
-        const candidate=packet(stock[rotated[0]],size,day,profiles,moved,visited,rotated[1],rnd);
+        const candidate=packet(stock[rotated[0]],size,day,profiles,events,splits,merges,visited,rotated[1],stock[rotated[1]],rnd);
         if(candidate){order=rotated;units=size;first=candidate;break outer;}
       }
       if(!first)throw Error('Cycle lost its eligible anchor');
       const cycle:PlanStep[]=[];
       for(let position=0;position<order.length;position++){
         const from=order[position],to=order[(position+1)%order.length];
-        const parts=position===0?first:packet(stock[from],units,day,profiles,moved,visited,to,rnd);
+        const parts=position===0?first:packet(stock[from],units,day,profiles,events,splits,merges,visited,to,stock[to],rnd);
         if(!parts)throw Error('Incoming packet fallback was lost');
         const allocations=parts.flatMap((count,owner)=>count?[{ownerAddress:members[owner].address,amountSun:count*UNIT}]:[]);
         for(let owner=0;owner<n;owner++){
+          if(parts[owner]){
+            events[owner]++;
+            if(stock[from][owner]>parts[owner])splits[owner]++;
+            if(stock[to][owner]>0)merges[owner]++;
+          }
           stock[from][owner]-=parts[owner];stock[to][owner]+=parts[owner];
           if(stock[from][owner]<0)throw Error('Planner overspent an ownership position');
-          if(parts[owner]){moved[owner]+=parts[owner];visited[owner].add(to);}
+          if(parts[owner])visited[owner].add(to);
         }
         cycle.push({kind:'MIX',from:members[from].address,to:members[to].address,amountSun:units*UNIT,
           day,plannedAt:new Date(0),allocations,dependsIndex:null});
@@ -122,7 +134,7 @@ export function buildCampaignPlan(members:Member[],seed:string,startedAt:Date,to
     while(cycles.some(c=>c.length)){
       const remaining=cycles.filter(c=>c.length),cycle=remaining[integer(0,remaining.length-1)],step=cycle.shift()!;
       step.plannedAt=new Date(clock);step.dependsIndex=steps.length?steps.length-1:null;steps.push(step);
-      clock+=integer(1,3)*60_000;
+      clock+=integer(60,120)*1000; // preview for a full quota; runtime extends to 5–10 minutes when needed
     }
     if(stock.some(row=>row.reduce((a,b)=>a+b,0)!==8))throw Error('Daily cycle failed to preserve wallet balances');
   }

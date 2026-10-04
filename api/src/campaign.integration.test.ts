@@ -3,7 +3,8 @@ import {strictEqual,ok,rejects,deepStrictEqual,match} from 'node:assert';
 import {execFileSync} from 'node:child_process';
 import {mkdtemp,readFile,readdir,rm} from 'node:fs/promises';
 import {join} from 'node:path';
-import {PrismaClient} from '@prisma/client';
+import type {PrismaClient} from '@prisma/client';
+import {createDatabase} from './database.js';
 
 process.env.TRON_MODE='mock';
 
@@ -14,7 +15,7 @@ async function fixture(count:number){
   execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql]);
   process.env.DATABASE_URL=`file:${join(directory,'pool.db')}`;
   const [{loadConfig},{TronService},{EngineService}]=await Promise.all([import('./config.js'),import('./tron.js'),import('./engine.js')]);
-  const config=await loadConfig(),db=new PrismaClient(),members=config.wallets.slice(0,count);
+  const config=await loadConfig(),db=createDatabase(),members=config.wallets.slice(0,count);
   let tron=new TronService(db,config),engine=new EngineService(db,tron,config,true);
   await engine.init();engine.stop();
   for(let i=0;i<count;i++){
@@ -46,7 +47,7 @@ async function drain(f:Awaited<ReturnType<typeof fixture>>,target:string){
     const flight=await f.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED']}}});
     if(!flight){
       const kind=s.phase==='CAMPAIGN'?'MIX':s.phase==='SETTLING'?'PAYOUT':'RETURN';
-      const next=await f.db.transfer.findFirst({where:{kind,status:{in:['PLANNED','APPROVED']}},orderBy:kind==='MIX'?{sequence:'asc'}:[{scheduledAt:'asc'},{sequence:'asc'}]});
+      const next=await f.db.transfer.findFirst({where:{kind,status:{in:['PLANNED','APPROVED']}},orderBy:['MIX','PAYOUT'].includes(kind)?{sequence:'asc'}:[{scheduledAt:'asc'},{sequence:'asc'}]});
       if(next){f.clock.at=Math.max(f.clock.at,next.scheduledAt.getTime()+1000);if(next.status==='PLANNED')await f.engine.approve(next.id);}
     }
     await f.engine.tick();
@@ -202,5 +203,100 @@ test('tampered attribution halts before building or broadcasting a native transf
     await f.engine.tick();
     strictEqual((await f.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'HALTED');
     strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0);
+  }finally{await f.close();}
+});
+
+test('saved alternatives and role swaps are durable preparation only; explicit Start fixes the selected template',async()=>{
+  const f=await fixture(4);
+  try{
+    const {variantList,loadVariant}=await import('./plan-variants.js');
+    const {ownerReport,variantOwnerReport,reportCsv}=await import('./campaign-report.js');
+    for(const w of f.members)await f.engine.autoApprove(w.address,true);
+    const deadlineAt=new Date(f.clock.at+41*86_400_000);
+    await f.engine.generatePlan({totalDays:36,deadlineAt});
+    const first=await f.db.planVariant.findFirstOrThrow({orderBy:{number:'asc'}});
+    strictEqual(await f.db.transfer.count(),0);strictEqual((await f.db.engineState.findUniqueOrThrow({where:{id:1}})).phase,'PREPARING');
+    await f.restart();await f.engine.tick();strictEqual(await f.db.transfer.count(),0);
+    const preview=await ownerReport(f.db,f.members[0].address);ok(preview);ok(preview!.events.every(t=>t.status==='DRAFT'));
+    ok(reportCsv(preview!).includes('DRAFT'));
+    await f.engine.generatePlan();
+    const second=await f.db.planVariant.findFirstOrThrow({orderBy:{number:'desc'}});
+    strictEqual(second.deadlineAt.getTime(),deadlineAt.getTime());strictEqual(second.totalDays,36);
+    await f.engine.selectPlan(first.id);
+    await f.engine.swapPlans(first.id,f.members[0].address,f.members[1].address);
+    const third=await f.db.planVariant.findFirstOrThrow({orderBy:{number:'desc'}});
+    strictEqual(third.parentId,first.id);
+    strictEqual((await f.db.planVariant.findUniqueOrThrow({where:{id:first.id}})).planJson,first.planJson);
+    strictEqual(variantOwnerReport(third,f.members[0].address)!.shapeSignature,variantOwnerReport(first,f.members[1].address)!.shapeSignature);
+    await f.restart();strictEqual((await variantList(f.db)).selectedId,third.id);
+    f.clock.at+=60_000;await f.engine.startCampaign();
+    const c=await f.db.campaign.findFirstOrThrow();strictEqual(c.planVariantId,third.id);strictEqual(c.deadlineAt.getTime(),deadlineAt.getTime());
+    const rows=await f.db.transfer.findMany({where:{campaignId:c.id},include:{allocations:true},orderBy:{sequence:'asc'}});
+    const loaded=loadVariant(third,c.startedAt);
+    deepStrictEqual(rows.map(r=>[r.from,r.to,r.amountSun,r.scheduledAt.getTime()]),loaded.plan.steps.map(r=>[r.from,r.to,r.amountSun,r.plannedAt.getTime()]));
+    ok(rows.every(r=>r.status==='APPROVED'&&r.approvalSource==='AUTO'));
+    f.clock.at=rows[0].scheduledAt.getTime()+1000;await f.engine.tick();
+    ok((await f.db.campaign.findUniqueOrThrow({where:{id:c.id}})).executionStartedAt);
+    for(const mutation of [()=>f.engine.generatePlan(),()=>f.engine.selectPlan(first.id),()=>f.engine.swapPlans(first.id,f.members[0].address,f.members[1].address)])
+      await rejects(mutation(),/in flight|begun signing/);
+    await f.engine.tick();await f.restart();
+    await rejects(f.engine.generatePlan(),/begun signing/);
+  }finally{await f.close();}
+});
+
+test('editing an unstarted upgraded campaign retains its original alternative and revokes old approvals',async()=>{
+  const f=await fixture(3);
+  try{
+    await f.engine.startCampaign();
+    const c=await f.db.campaign.findFirstOrThrow(),first=await f.db.transfer.findFirstOrThrow({orderBy:{sequence:'asc'}});
+    await f.engine.approve(first.id);
+    await f.db.campaign.update({where:{id:c.id},data:{planVariantId:null,version:1}});
+    await f.db.engineState.update({where:{id:1},data:{selectedPlanVariantId:null}});
+    await f.db.planVariant.deleteMany();
+    const before=await f.db.transfer.count();await f.engine.generatePlan();
+    strictEqual(await f.db.transfer.count(),before);strictEqual(await f.db.planVariant.count(),2);
+    strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:first.id}})).status,'CANCELLED');
+    const old=await f.db.planVariant.findFirstOrThrow({where:{sourceCampaignId:c.id}});
+    await f.engine.selectPlan(old.id);await f.restart();strictEqual(await f.db.transfer.count({where:{txId:{not:null}}}),0);
+    await f.engine.startCampaign();strictEqual(await f.db.campaign.count(),2);
+    strictEqual((await f.db.campaign.findUniqueOrThrow({where:{id:c.id}})).status,'SUPERSEDED');
+  }finally{await f.close();}
+});
+
+test('failed signing keeps a permanent edit lock even without a txID',async()=>{
+  const f=await fixture(3);
+  try{
+    await f.engine.generatePlan();const variant=await f.db.planVariant.findFirstOrThrow();await f.engine.startCampaign();
+    const first=await f.db.transfer.findFirstOrThrow({where:{kind:'MIX'},orderBy:{sequence:'asc'}});
+    const prepare=f.tron.prepare.bind(f.tron);
+    f.tron.prepare=async(...args)=>{await prepare(...args);throw Error('simulated signing failure');};
+    f.clock.at=first.scheduledAt.getTime()+1000;await f.engine.approve(first.id);
+    const row=await f.db.transfer.findUniqueOrThrow({where:{id:first.id}});strictEqual(row.txId,null);
+    ok((await f.db.campaign.findFirstOrThrow()).executionStartedAt);
+    await rejects(f.engine.generatePlan(),/begun signing/);
+    await rejects(f.engine.swapPlans(variant.id,f.members[0].address,f.members[1].address),/begun signing/);
+    await f.db.transfer.update({where:{id:first.id},data:{scheduledAt:new Date(f.clock.at+86_400_000)}});
+    await f.restart();await rejects(f.engine.selectPlan(variant.id),/begun signing/);
+  }finally{await f.close();}
+});
+
+for(const [available,min,max] of [[600,60_000,120_000],[500,300_000,600_000]])test(`random spacing is durable with ${available} bandwidth`,async()=>{
+  const f=await fixture(3);
+  try{
+    await f.engine.startCampaign();
+    const rows=await f.db.transfer.findMany({where:{kind:'MIX'},orderBy:{sequence:'asc'},take:2});
+    f.clock.at=rows[0].scheduledAt.getTime()+1000;await f.engine.approve(rows[0].id);await f.engine.tick();
+    const previous=await f.db.transfer.findUniqueOrThrow({where:{id:rows[0].id}});strictEqual(previous.status,'CONFIRMED');
+    f.tron.bandwidthSnapshot=async()=>({available,limit:600,observedAt:f.clock.at});
+    await f.db.transfer.update({where:{id:rows[1].id},data:{scheduledAt:new Date(f.clock.at)}});
+    await f.engine.approve(rows[1].id);
+    const delayed=await f.db.transfer.findUniqueOrThrow({where:{id:rows[1].id}});
+    strictEqual(delayed.status,'APPROVED');ok(delayed.pacingDelayMs!>=min&&delayed.pacingDelayMs!<=max);
+    strictEqual(delayed.pacingAfterId,previous.id);strictEqual(delayed.scheduledAt.getTime(),previous.confirmedAt!.getTime()+delayed.pacingDelayMs!);
+    await f.restart();
+    const restored=await f.db.transfer.findUniqueOrThrow({where:{id:rows[1].id}});
+    strictEqual(restored.pacingDelayMs,delayed.pacingDelayMs);strictEqual(restored.scheduledAt.getTime(),delayed.scheduledAt.getTime());
+    f.clock.at=restored.scheduledAt.getTime()+1000;await f.engine.tick();
+    strictEqual((await f.db.transfer.findUniqueOrThrow({where:{id:rows[1].id}})).status,'SUBMITTED');
   }finally{await f.close();}
 });

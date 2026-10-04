@@ -1,85 +1,51 @@
-import {createHash} from 'node:crypto';
 import type {PrismaClient} from '@prisma/client';
 import {TARGET} from './config.js';
 import {replayOwnership,type OwnedTransfer} from './ownership.js';
 import type {Profile} from './campaign-plan.js';
+import {loadVariant,planRows} from './plan-variants.js';
+import type {PlanVariant} from '@prisma/client';
 
-export type FlowNode={id:string;type:'holding'|'transfer';wallet:string;amountSun:number;nativeSun?:number;
-  day:number;sequence?:number;status:string;rank:number};
-export type FlowEdge={id:string;from:string;to:string;amountSun:number;status:string};
-type ReportTransfer=OwnedTransfer & {campaignDay:number|null;scheduledAt:Date;plannedAt:Date|null;
-  confirmedAt:Date|null;bandwidthUsed:number|null;txId:string|null;note:string|null};
+export {ownershipFlow,shapeSignature} from './ownership-flow.js';
+import {ownershipFlow,shapeSignature} from './ownership-flow.js';
 
-/** Actual branching DAG: a partial departure leaves a holding branch;
- * receipt at a holder with this owner's funds merges its two predecessors.
- * Holding edges are explicitly separate from native transaction nodes. */
-export function ownershipFlow(owner:string,rows:(OwnedTransfer & {campaignDay:number|null})[]){
-  const nodes:FlowNode[]=[{id:'root',type:'holding',wallet:owner,amountSun:TARGET,day:0,status:'INITIAL',rank:0}];
-  const edges:FlowEdge[]=[];
-  const held=new Map([[owner,{id:'root',sun:TARGET,rank:0}]]);
-  let splits=0,merges=0;
-  for(const row of rows){
-    const allocation=row.allocations.find(a=>a.ownerAddress===owner);if(!allocation)continue;
-    const source=held.get(row.from);
-    if(!source||source.sun<allocation.amountSun)throw Error(`Invalid owner graph at #${row.sequence}`);
-    const incoming=held.get(row.to),rank=Math.max(source.rank,incoming?.rank??0)+1;
-    const txId=`tx:${row.id}`,receiptId=`stock:${row.id}`,day=row.campaignDay??0;
-    nodes.push({id:txId,type:'transfer',wallet:row.from,amountSun:allocation.amountSun,nativeSun:row.amountSun,
-      day,sequence:row.sequence,status:row.status,rank});
-    edges.push({id:`depart:${row.id}`,from:source.id,to:txId,amountSun:allocation.amountSun,status:row.status});
-    if(source.sun>allocation.amountSun){
-      splits++;
-      const id=`remain:${row.id}`,sun=source.sun-allocation.amountSun;
-      nodes.push({id,type:'holding',wallet:row.from,amountSun:sun,day,status:row.status,rank});
-      edges.push({id:`retain:${row.id}`,from:source.id,to:id,amountSun:sun,status:'HOLD'});
-      held.set(row.from,{id,sun,rank});
-    }else held.delete(row.from);
-    if(row.kind==='PAYOUT'){
-      nodes.push({id:receiptId,type:'holding',wallet:row.to,amountSun:allocation.amountSun,day,status:row.status,rank:rank+1});
-      edges.push({id:`arrive:${row.id}`,from:txId,to:receiptId,amountSun:allocation.amountSun,status:row.status});
-      continue;
-    }
-    const sun=(incoming?.sun??0)+allocation.amountSun;
-    nodes.push({id:receiptId,type:'holding',wallet:row.to,amountSun:sun,day,status:row.status,rank:rank+1});
-    edges.push({id:`arrive:${row.id}`,from:txId,to:receiptId,amountSun:allocation.amountSun,status:row.status});
-    if(incoming){merges++;edges.push({id:`merge:${row.id}`,from:incoming.id,to:receiptId,amountSun:incoming.sun,status:'HOLD'});}
-    held.set(row.to,{id:receiptId,sun,rank:rank+1});
-  }
-  return {nodes,edges,splits,merges};
-}
-
-// Unequal invariant summaries guarantee different weighted graph shapes.
-// Ignore addresses, dates and labels: changing only a name is insufficient.
-export function shapeSignature(flow:ReturnType<typeof ownershipFlow>){
-  const counters=new Map<string,number>();
-  for(const n of flow.nodes){const key=`${n.type}:${n.amountSun}:${n.nativeSun??0}`;counters.set(key,(counters.get(key)??0)+1);}
-  return createHash('sha256').update(JSON.stringify([flow.splits,flow.merges,[...counters].sort()])).digest('hex');
-}
-
+// These are public read models. Do not take SQLite's global write lock
+// with an interactive transaction, and render DAGs after releasing DB work.
 export async function campaignSummary(db:PrismaClient){
-  return db.$transaction(async tx=>{
-    const state=await tx.engineState.findUniqueOrThrow({where:{id:1}});
-    if(!state.activeCampaignId)return null;
-    const c=await tx.campaign.findUniqueOrThrow({where:{id:state.activeCampaignId},include:{members:{orderBy:{ordinal:'asc'}},positions:true}});
-    const rows=await tx.transfer.findMany({where:{campaignId:c.id},select:{status:true,kind:true,scheduledAt:true,from:true}});
-    const pending=rows.filter(t=>!['CANCELLED','CONFIRMED'].includes(t.status));
-    const forecastEndsAt=pending.length?new Date(Math.max(...pending.map(t=>t.scheduledAt.getTime()))):null;
-    return {...c,members:c.members.map(m=>({...m,profile:JSON.parse(m.profileJson) as Profile,profileJson:undefined})),
-      total:rows.filter(t=>t.status!=='CANCELLED').length,confirmed:rows.filter(t=>t.status==='CONFIRMED').length,
-      mixingTransfers:rows.filter(t=>t.kind==='MIX'&&t.status!=='CANCELLED').length,
-      forecastEndsAt,deadlineRisk:forecastEndsAt!==null&&forecastEndsAt.getTime()>c.deadlineAt.getTime()-4*86_400_000};
-  });
+  const state=await db.engineState.findUniqueOrThrow({where:{id:1}});
+  if(state.phase==='PREPARING'&&state.selectedPlanVariantId){
+    const v=await db.planVariant.findUniqueOrThrow({where:{id:state.selectedPlanVariantId}});
+    return draftSummary(v);
+  }
+  if(!state.activeCampaignId)return null;
+  const c=await db.campaign.findUniqueOrThrow({where:{id:state.activeCampaignId},include:{members:{orderBy:{ordinal:'asc'}},positions:true}});
+  const rows=await db.transfer.findMany({where:{campaignId:c.id},select:{status:true,kind:true,scheduledAt:true,from:true}});
+  const pending=rows.filter(t=>!['CANCELLED','CONFIRMED'].includes(t.status));
+  const forecastEndsAt=pending.length?new Date(Math.max(...pending.map(t=>t.scheduledAt.getTime()))):null;
+  return {...c,members:c.members.map(m=>({...m,profile:JSON.parse(m.profileJson) as Profile,profileJson:undefined})),
+    total:rows.filter(t=>t.status!=='CANCELLED').length,confirmed:rows.filter(t=>t.status==='CONFIRMED').length,
+    mixingTransfers:rows.filter(t=>t.kind==='MIX'&&t.status!=='CANCELLED').length,
+    forecastEndsAt,deadlineRisk:forecastEndsAt!==null&&forecastEndsAt.getTime()>c.deadlineAt.getTime()-4*86_400_000};
+}
+export async function ownerReport(db:PrismaClient,address:string,campaignId?:string){
+  const s=await db.engineState.findUniqueOrThrow({where:{id:1}});
+  if(!campaignId&&s.phase==='PREPARING'&&s.selectedPlanVariantId){
+    const v=await db.planVariant.findUniqueOrThrow({where:{id:s.selectedPlanVariantId}});
+    return variantOwnerReport(v,address);
+  }
+  const id=campaignId??s.activeCampaignId;if(!id)return null;
+  const campaign=await db.campaign.findUnique({where:{id},include:{members:{orderBy:{ordinal:'asc'}}}});
+  if(!campaign||!campaign.members.some(m=>m.address===address))return null;
+  const rows=await db.transfer.findMany({where:{campaignId:id},orderBy:{sequence:'asc'},
+    select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,campaignDay:true,scheduledAt:true,
+      plannedAt:true,confirmedAt:true,bandwidthUsed:true,txId:true,note:true,allocations:{select:{ownerAddress:true,amountSun:true}}}});
+  return makeOwnerReport(address,campaign,rows);
 }
 
-export async function ownerReport(db:PrismaClient,address:string,campaignId?:string){
-  return db.$transaction(async tx=>{
-    const s=await tx.engineState.findUniqueOrThrow({where:{id:1}});
-    const id=campaignId??s.activeCampaignId;if(!id)return null;
-    const campaign=await tx.campaign.findUnique({where:{id},include:{members:{orderBy:{ordinal:'asc'}}}});
-    if(!campaign||!campaign.members.some(m=>m.address===address))return null;
-    const rows=await tx.transfer.findMany({where:{campaignId:id},orderBy:{sequence:'asc'},
-      select:{id:true,sequence:true,kind:true,status:true,from:true,to:true,amountSun:true,campaignDay:true,scheduledAt:true,
-        plannedAt:true,confirmedAt:true,bandwidthUsed:true,txId:true,note:true,allocations:{select:{ownerAddress:true,amountSun:true}}}});
+type ReportRow=OwnedTransfer & {campaignDay:number|null;scheduledAt:Date;plannedAt:Date|null;confirmedAt:Date|null;
+  bandwidthUsed:number|null;txId:string|null;note:string|null};
+type ReportCampaign={id:string;status:string;startedAt:Date;deadlineAt:Date;totalDays:number;mixingDays:number;
+  variantId?:string;members:{address:string;ordinal:number;profileJson:string}[]};
+function makeOwnerReport(address:string,campaign:ReportCampaign,rows:ReportRow[]){
     const active=rows.filter(t=>t.status!=='CANCELLED');
     const members=campaign.members.map(m=>m.address);
     const confirmedPositions=replayOwnership(members,active.filter(t=>t.status==='CONFIRMED'));
@@ -110,7 +76,22 @@ export async function ownerReport(db:PrismaClient,address:string,campaignId?:str
       positions:confirmedPositions.filter(p=>p.ownerAddress===address),finalPositions:plannedPositions.filter(p=>p.ownerAddress===address),
       flow,shapeSignature:shapeSignature(flow),actualSends:active.filter(t=>t.from===address&&t.status==='CONFIRMED').length,
       plannedMixSends:active.filter(t=>t.from===address&&t.kind==='MIX').length};
-  },{timeout:30_000});
+}
+function draftCampaign(v:PlanVariant,loaded=loadVariant(v)){
+  const {members,plan}=loaded;
+  return {id:v.id,variantId:v.id,status:'DRAFT',startedAt:v.anchorAt,deadlineAt:v.deadlineAt,totalDays:v.totalDays,mixingDays:plan.mixingDays,
+    members:members.map((m,i)=>({...m,profileJson:JSON.stringify(plan.profiles[i])}))};
+}
+function draftSummary(v:PlanVariant){
+  const loaded=loadVariant(v),{members,plan}=loaded,c=draftCampaign(v,loaded);
+  const forecastEndsAt=new Date(Math.max(...plan.steps.map(t=>t.plannedAt.getTime())));
+  return {...c,draft:true,payAfterReturn:false,positions:members.map(m=>({ownerAddress:m.address,holderAddress:m.address,amountSun:TARGET})),
+    members:members.map((m,i)=>({...m,profile:plan.profiles[i]})),total:plan.steps.length,confirmed:0,
+    mixingTransfers:plan.steps.filter(t=>t.kind==='MIX').length,forecastEndsAt,deadlineRisk:forecastEndsAt.getTime()>v.deadlineAt.getTime()-4*86_400_000};
+}
+export function variantOwnerReport(v:PlanVariant,address:string){
+  const loaded=loadVariant(v),{members,plan}=loaded;if(!members.some(m=>m.address===address))return null;
+  return makeOwnerReport(address,draftCampaign(v,loaded),planRows(plan,v.id));
 }
 
 function csvCell(value:unknown){

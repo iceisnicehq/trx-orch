@@ -93,3 +93,5 @@
 .report-detail small{display:block;color:#86adb5;line-height:1.5}
 .history-overlay{z-index:6}.overlay:not(.history-overlay){z-index:8}
 @media(max-width:650px){.campaign-inputs{grid-template-columns:1fr}.ownership-canvas{height:380px}.history-dialog{max-height:96vh}.owner-positions>span{max-width:100%}}
+
+.plan-manager{margin:22px 0}.plan-prepare{display:flex;flex-wrap:wrap;align-items:end;gap:12px;margin:16px 0}.plan-prepare label{display:grid;gap:6px;font-size:12px;color:var(--muted)}.plan-prepare input,.plan-prepare select{max-width:100%;min-height:38px}.plan-prepare button{min-height:38px}.plan-comparison{max-height:530px}.plan-manager .report-facts{flex-wrap:wrap}.tag.draft{color:#bcc6e5;background:#23304d}

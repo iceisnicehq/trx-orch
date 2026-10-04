@@ -7,29 +7,29 @@ type ReportEvent={id:string;sequence:number;kind:string;status:string;from:strin
   campaignDay:number;plannedAt:string;scheduledAt:string;confirmedAt:string|null;bandwidthUsed:number|null;txId:string|null;
   allocations:Share[];fromComposition:Share[];toComposition:Share[]};
 type Report={address:string;profile:{type:string;releaseDay:number;quarterDay:number;eighthDay:number|null};
-  campaign:{id:string;status:string;totalDays:number;members:{address:string;ordinal:number}[]};events:ReportEvent[];
+  campaign:{id:string;variantId?:string;status:string;totalDays:number;members:{address:string;ordinal:number}[]};events:ReportEvent[];
   positions:Position[];finalPositions:Position[];flow:Flow;cancelled:ReportEvent[];plannedMixSends:number};
 const fmt=(sun:number)=>(sun/1_000_000).toFixed(6)+' TRX';
 const when=(s:string)=>new Date(s).toLocaleString('en-GB',{timeZone:'Europe/Moscow',hour12:false})+' MSK';
 
-export function StakeReport({address,revision}:{address:string;revision:string}){
+export function StakeReport({address,revision,variantId}:{address:string;revision:string;variantId?:string}){
   const [report,setReport]=useState<Report|null>(null),[error,setError]=useState(''),[loading,setLoading]=useState(false);
   const [filter,setFilter]=useState('ALL'),[day,setDay]=useState(60),[selectedId,setSelectedId]=useState<string|null>(null);
   const [campaignId,setCampaignId]=useState(''),[archives,setArchives]=useState<{id:string;startedAt:string;status:string}[]>([]);
   const request=useRef(0);
-  useEffect(()=>{setReport(null);setSelectedId(null);setDay(60);},[address,campaignId]);
+  useEffect(()=>{setReport(null);setSelectedId(null);setDay(60);},[address,campaignId,variantId]);
   useEffect(()=>{void fetch('/api/campaigns',{cache:'no-store'}).then(r=>r.json()).then(setArchives).catch(()=>{});},[address]);
   useEffect(()=>{
     const id=++request.current;setLoading(true);setError('');
-    void fetch(`/api/campaign/report/${encodeURIComponent(address)}${campaignId?'?campaignId='+encodeURIComponent(campaignId):''}`,{cache:'no-store'})
+    void fetch(variantId?`/api/plans/${encodeURIComponent(variantId)}/report/${encodeURIComponent(address)}`:`/api/campaign/report/${encodeURIComponent(address)}${campaignId?'?campaignId='+encodeURIComponent(campaignId):''}`,{cache:'no-store'})
       .then(async r=>{const body=await r.json();if(!r.ok)throw Error(body.error??'Report unavailable');return body as Report;})
       .then(data=>{if(id===request.current){setReport(data);setDay(previous=>Math.min(previous,Math.max(data.campaign.totalDays,...data.events.map(e=>e.campaignDay))));}})
       .catch(e=>{if(id===request.current){setError(String(e));setReport(null);}})
       .finally(()=>{if(id===request.current)setLoading(false);});
     return()=>{request.current++;};
-  },[address,revision,campaignId]);
+  },[address,revision,campaignId,variantId]);
   function selectCampaign(value:string){setCampaignId(value);setSelectedId(null);setDay(60);}
-  if(!report)return <div className="stake-report"><select aria-label="Campaign archive" value={campaignId} onChange={e=>selectCampaign(e.target.value)}><option value="">Текущий план</option>{archives.map(a=><option key={a.id} value={a.id}>{when(a.startedAt)} · {a.status}</option>)}</select>
+  if(!report)return <div className="stake-report">{!variantId&&<select aria-label="Campaign archive" value={campaignId} onChange={e=>selectCampaign(e.target.value)}><option value="">Текущий план</option>{archives.map(a=><option key={a.id} value={a.id}>{when(a.startedAt)} · {a.status}</option>)}</select>}
     {error&&<p className="history-intro">Для этого кошелька нет отчёта в выбранной кампании. История адреса доступна на соседней вкладке.<br/>{error}</p>}{loading&&<p>Загрузка плана…</p>}</div>;
   const name=(a:string)=>{const m=report.campaign.members.find(m=>m.address===a);return m?`Node ${m.ordinal+1}`:'Teacher';};
   const maxDay=Math.max(report.campaign.totalDays,...report.events.map(e=>e.campaignDay));
@@ -37,8 +37,9 @@ export function StakeReport({address,revision}:{address:string;revision:string})
   const rows=report.events.filter(e=>filter==='ALL'||(filter==='CONFIRMED'?e.status==='CONFIRMED':e.status!=='CONFIRMED'));
   const composition=(shares:Share[])=>shares.map(a=>`${name(a.ownerAddress)}: ${fmt(a.amountSun)}`).join(' + ')||'0 TRX';
   return <div className="stake-report">
-    <div className="report-toolbar"><select aria-label="Campaign archive" value={campaignId} onChange={e=>selectCampaign(e.target.value)}><option value="">Текущий план</option>{archives.map(a=><option key={a.id} value={a.id}>{when(a.startedAt)} · {a.status}</option>)}</select>
-      <a className="report-download" href={`/api/campaign/report/${encodeURIComponent(address)}?format=csv&campaignId=${encodeURIComponent(report.campaign.id)}`}>Экспорт полного CSV</a>{loading&&<small>Обновление…</small>}</div>
+    <div className="report-toolbar">{!variantId&&<select aria-label="Campaign archive" value={campaignId} onChange={e=>selectCampaign(e.target.value)}><option value="">Текущий план</option>{archives.map(a=><option key={a.id} value={a.id}>{when(a.startedAt)} · {a.status}</option>)}</select>}
+      <a className="report-download" href={report.campaign.variantId?`/api/plans/${encodeURIComponent(report.campaign.variantId)}/report/${encodeURIComponent(address)}?format=csv`:`/api/campaign/report/${encodeURIComponent(address)}?format=csv&campaignId=${encodeURIComponent(report.campaign.id)}`}>Экспорт полного CSV</a>{loading&&<small>Обновление…</small>}</div>
+    {report.campaign.variantId&&<p className="campaign-warning">Предпросмотр сохранённого варианта. День 1 отсчитывается от будущего Start; показанные даты — ориентир генерации. Дедлайн остаётся фиксированным. DRAFT не является одобрением.</p>}
     <p className="history-intro">Здесь движение исходного <b>1 TRX этого участника</b>, включая переводы между чужими адресами. Принадлежность долей задаёт сохранённый учёт кампании; в TRON монеты не имеют метки владельца. CSV содержит все будущие и подтверждённые шаги, полные адреса и состав переводов.</p>
     <div className="report-facts"><span>{report.events.length} шагов этой ставки</span><span>{report.flow.splits} разветвлений · {report.flow.merges} объединений</span><span>{report.plannedMixSends} MIX-отправок с адреса</span></div>
     <p className="history-intro">Профиль: {report.profile.type}. Допуск первого дробления — день {report.profile.releaseDay}; долей 0,25 — день {report.profile.quarterDay}{report.profile.eighthDay!==null?`; 0,125 — день ${report.profile.eighthDay}`:'; доли 0,125 для этого участника не используются'}. Фактические разветвления видны на схеме.</p>

@@ -3,7 +3,8 @@ import {deepStrictEqual,match,strictEqual} from 'node:assert';
 import {execFileSync} from 'node:child_process';
 import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
-import {PrismaClient} from '@prisma/client';
+import type {PrismaClient} from '@prisma/client';
+import {createDatabase} from './database.js';
 import {renderQueue,TelegramService} from './telegram.js';
 
 test('Telegram edits a compact queue, sends audit details, and retries after restart',async()=>{
@@ -18,8 +19,8 @@ test('Telegram edits a compact queue, sends audit details, and retries after res
       '20260929020000_telegram_notifications','20260929030000_rebalance_and_amount_modes',
       '20260930000000_external_extra_reserves'
     ].map(dir=>readFile(`prisma/migrations/${dir}/migration.sql`,'utf8')))).join('\n');
-    execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql+'\n'+await readFile('prisma/migrations/20261004000000_campaign_ownership/migration.sql','utf8')]);
-    db=new PrismaClient();
+    execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql+'\n'+await readFile('prisma/migrations/20261004000000_campaign_ownership/migration.sql','utf8')+'\n'+await readFile('prisma/migrations/20261004010000_plan_variants/migration.sql','utf8')]);
+    db=createDatabase();
     const first=`T${'A'.repeat(30)}123`,second=`T${'B'.repeat(30)}987`,teacher=`T${'C'.repeat(30)}XYZ`;
     await db.wallet.createMany({data:[{address:first,ordinal:0},{address:second,ordinal:1}]});
     await db.engineState.create({data:{id:1,teacherAddress:teacher,teacherBaseline:0,phase:'MIXING'}});

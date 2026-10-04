@@ -3,7 +3,8 @@ import {strictEqual,deepStrictEqual,rejects} from 'node:assert';
 import {execFileSync} from 'node:child_process';
 import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
-import {PrismaClient} from '@prisma/client';
+import type {PrismaClient} from '@prisma/client';
+import {createDatabase} from './database.js';
 
 test('two-wallet start, later join, replan, manual approvals and exact payouts',async()=>{
   const directory=await mkdtemp(join(process.cwd(),'.testdb-'));
@@ -22,12 +23,12 @@ test('two-wallet start, later join, replan, manual approvals and exact payouts',
       readFile('prisma/migrations/20260929030000_rebalance_and_amount_modes/migration.sql','utf8'),
       readFile('prisma/migrations/20260930000000_external_extra_reserves/migration.sql','utf8')
     ])).join('\n');
-    execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql+'\n'+await readFile('prisma/migrations/20261004000000_campaign_ownership/migration.sql','utf8')]);
+    execFileSync('python3',['-c','import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()',join(directory,'pool.db'),sql+'\n'+await readFile('prisma/migrations/20261004000000_campaign_ownership/migration.sql','utf8')+'\n'+await readFile('prisma/migrations/20261004010000_plan_variants/migration.sql','utf8')]);
     const [{loadConfig,TARGET},{TronService},{EngineService}]=await Promise.all([
       import('./config.js'),import('./tron.js'),import('./engine.js')
     ]);
     const config=await loadConfig();
-    db=new PrismaClient();
+    db=createDatabase();
     const tron=new TronService(db,config),engine=new EngineService(db,tron,config);
     await engine.init();
     const [one,two,three,...rest]=config.wallets;

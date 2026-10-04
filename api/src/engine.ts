@@ -1,13 +1,13 @@
 import {randomInt,randomBytes,randomUUID} from 'node:crypto';
 import {TronWeb} from 'tronweb';
-import type {EngineState,PrismaClient,Transfer,Wallet} from '@prisma/client';
+import type {EngineState,Prisma,PrismaClient,Transfer,Wallet} from '@prisma/client';
 import {MODE,TARGET,type Config} from './config.js';
 import {settleTargets,settlementPlan} from './settlement.js';
 import {BandwidthWait,TronService} from './tron.js';
 import {bufferedReadyAt,MIN_FREE_BANDWIDTH} from './recovery.js';
-import {buildCampaignPlan,DAY,type CampaignPlan} from './campaign-plan.js';
+import {DAY,type CampaignPlan} from './campaign-plan.js';
 import {applyConfirmedOwnership,verifyOwnership,attributedReturns,OwnershipError} from './ownership.js';
-import {ownershipFlow,shapeSignature} from './campaign-report.js';
+import {buildBalancedPlan,loadVariant,saveVariant,swapPlan,serializePlan,preparationPermission} from './plan-variants.js';
 
 export class HttpError extends Error {constructor(public code:number,message:string){super(message);}}
 const MIN_MIX_GAP_MS=60*60_000;
@@ -240,13 +240,111 @@ export class EngineService {
     return {ok:true,teacherAddress:address};
   });}
 
+  private async assertPreparation(){
+    const permission=await preparationPermission(this.db);
+    if(!permission.canEdit)throw new HttpError(409,permission.reason!);
+    return this.state();
+  }
+  private async archiveUnstarted(tx:Prisma.TransactionClient,s:EngineState){
+    if(s.phase!=='CAMPAIGN'||!s.activeCampaignId)return;
+    const c=await tx.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId},include:{members:{orderBy:{ordinal:'asc'}}}});
+    if(!c.planVariantId){
+      const rows=await tx.transfer.findMany({where:{campaignId:c.id,status:{not:'CANCELLED'}},include:{allocations:true},orderBy:{sequence:'asc'}});
+      const index=new Map(rows.map((t,i)=>[t.id,i]));
+      const plan:CampaignPlan={seed:c.seed,totalDays:c.totalDays,mixingDays:c.mixingDays,
+        profiles:c.members.map(m=>JSON.parse(m.profileJson)),steps:rows.map(t=>({kind:t.kind as 'MIX'|'RETURN',from:t.from,to:t.to,
+          amountSun:t.amountSun,day:t.campaignDay!,plannedAt:t.plannedAt??t.scheduledAt,
+          dependsIndex:t.dependsOnId?index.get(t.dependsOnId)??null:null,
+          allocations:t.allocations.map(({ownerAddress,amountSun})=>({ownerAddress,amountSun}))}))};
+      const v=await saveVariant(tx,c.members,plan,c.startedAt,c.deadlineAt,{sourceCampaignId:c.id,generatorVersion:c.version});
+      await tx.campaign.update({where:{id:c.id},data:{planVariantId:v.id}});
+    }
+    await tx.transfer.updateMany({where:{campaignId:c.id,status:{in:['PLANNED','APPROVED','PAUSED']}},
+      data:{status:'CANCELLED',note:'Returned to preparation before execution; prior approvals revoked; saved variant retained'}});
+    await tx.campaign.update({where:{id:c.id},data:{status:'SUPERSEDED'}});
+  }
+  private checkDeadline(plan:CampaignPlan,deadlineAt:Date){
+    if(!Number.isFinite(deadlineAt.getTime())||Math.max(...plan.steps.map(t=>t.plannedAt.getTime()))>deadlineAt.getTime()-4*DAY)
+      throw new HttpError(400,'The complete plan must leave at least four days before the saved deadline. Shorten or regenerate the plan; the deadline is never extended automatically.');
+  }
+  async generatePlan(options:{totalDays?:number;deadlineAt?:Date}={}){return this.withLock(async()=>{
+    const s=await this.assertPreparation();
+    const selected=await this.db.wallet.findMany({where:{mixEnabled:true},orderBy:{ordinal:'asc'}});
+    if(selected.length<2)throw new HttpError(409,'Select at least two funded wallets');
+    const old=s.selectedPlanVariantId?await this.db.planVariant.findUnique({where:{id:s.selectedPlanVariantId}}):null;
+    const c=s.activeCampaignId?await this.db.campaign.findUnique({where:{id:s.activeCampaignId}}):null;
+    const totalDays=options.totalDays??old?.totalDays??c?.totalDays??36,anchorAt=new Date(Date.now()+2*60_000);
+    if(!Number.isInteger(totalDays)||totalDays<18||totalDays>60)throw new HttpError(400,'Choose 18–60 campaign days');
+    const deadlineAt=options.deadlineAt??old?.deadlineAt??c?.deadlineAt??new Date(anchorAt.getTime()+(totalDays+6)*DAY);
+    let plan:CampaignPlan;
+    try{plan=buildBalancedPlan(selected,randomBytes(16).toString('hex'),anchorAt,totalDays).plan;}
+    catch(e){throw new HttpError(409,(e as Error).message);}
+    this.checkDeadline(plan,deadlineAt);
+    const variant=await this.db.$transaction(async tx=>{
+      await this.archiveUnstarted(tx,s);
+      const v=await saveVariant(tx,selected,plan,anchorAt,deadlineAt);
+      await tx.engineState.update({where:{id:1},data:{phase:'PREPARING',activeCampaignId:null,selectedPlanVariantId:v.id,
+        status:`Preparation: variant #${v.number} selected; compare or swap roles, then explicitly Start; nothing is sent`}});
+      await tx.audit.create({data:{event:'PLAN_GENERATED',detail:`Saved variant #${v.number} ${v.id}; ${selected.length} members; deadline ${deadlineAt.toISOString()}; no transfers or approvals created`}});
+      return v;
+    },{timeout:60_000});
+    return {ok:true,variantId:variant.id};
+  });}
+  async prepareCurrent(){return this.withLock(async()=>{
+    const s=await this.assertPreparation();
+    if(s.phase!=='CAMPAIGN'||!s.activeCampaignId)throw new HttpError(409,'No unstarted campaign to save');
+    const v=await this.db.$transaction(async tx=>{
+      await this.archiveUnstarted(tx,s);
+      const c=await tx.campaign.findUniqueOrThrow({where:{id:s.activeCampaignId!}});
+      const v=await tx.planVariant.findUniqueOrThrow({where:{id:c.planVariantId!}});
+      await tx.engineState.update({where:{id:1},data:{phase:'PREPARING',activeCampaignId:null,selectedPlanVariantId:v.id,
+        status:`Preparation: current plan saved as variant #${v.number}; prior approvals revoked; Start required`}});
+      await tx.audit.create({data:{event:'PLAN_PREPARED',detail:`Campaign ${c.id} retained as variant #${v.number}; no execution; approvals revoked`}});
+      return v;
+    },{timeout:60_000});
+    return {ok:true,variantId:v.id};
+  });}
+  async selectPlan(id:string){return this.withLock(async()=>{
+    const s=await this.assertPreparation(),v=await this.db.planVariant.findUnique({where:{id}});
+    if(!v)throw new HttpError(404,'Saved plan not found');
+    const {members,plan}=loadVariant(v,new Date(Date.now()+2*60_000));
+    if(members.some(m=>!this.config.wallets.some(w=>w.address===m.address)))throw new HttpError(409,'Saved plan members differ from configured wallets');
+    this.checkDeadline(plan,v.deadlineAt);
+    await this.db.$transaction(async tx=>{
+      await this.archiveUnstarted(tx,s);
+      await tx.wallet.updateMany({data:{mixEnabled:false}});
+      await tx.wallet.updateMany({where:{address:{in:members.map(m=>m.address)}},data:{mixEnabled:true}});
+      await tx.engineState.update({where:{id:1},data:{phase:'PREPARING',activeCampaignId:null,selectedPlanVariantId:v.id,
+        status:`Preparation: saved variant #${v.number} selected; Start required`}});
+      await tx.audit.create({data:{event:'PLAN_SELECTED',detail:`Variant #${v.number} ${v.id}; cohort restored; nothing is sent until Start`}});
+    },{timeout:60_000});
+    return {ok:true,variantId:v.id};
+  });}
+  async swapPlans(id:string,a:string,b:string){return this.withLock(async()=>{
+    const s=await this.assertPreparation(),v=await this.db.planVariant.findUnique({where:{id}});
+    if(!v)throw new HttpError(404,'Saved plan not found');
+    const {members,plan}=loadVariant(v);
+    let swapped:CampaignPlan;try{swapped=swapPlan(members,plan,a,b);}catch(e){throw new HttpError(400,(e as Error).message);}
+    const rebased=loadVariant({...v,planJson:serializePlan(swapped,v.anchorAt)},new Date(Date.now()+2*60_000));
+    this.checkDeadline(rebased.plan,v.deadlineAt);
+    const next=await this.db.$transaction(async tx=>{
+      await this.archiveUnstarted(tx,s);
+      const next=await saveVariant(tx,members,swapped,v.anchorAt,v.deadlineAt,{parentId:v.id,generatorVersion:v.generatorVersion});
+      await tx.wallet.updateMany({data:{mixEnabled:false}});
+      await tx.wallet.updateMany({where:{address:{in:members.map(m=>m.address)}},data:{mixEnabled:true}});
+      await tx.engineState.update({where:{id:1},data:{phase:'PREPARING',activeCampaignId:null,selectedPlanVariantId:next.id,
+        status:`Preparation: swapped roles ${a} and ${b}; saved variant #${next.number}; Start required`}});
+      await tx.audit.create({data:{event:'PLAN_SWAPPED',detail:`Variant #${v.number} → #${next.number}; ${a} ↔ ${b}; routes, owners and profiles permuted together; original preserved`}});
+      return next;
+    },{timeout:60_000});
+    return {ok:true,variantId:next.id};
+  });}
   async startCampaign(options:{totalDays?:number;deadlineAt?:Date}={}){return this.withLock(async()=>{
     const s=await this.state();
-    if(!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED'].includes(s.phase))throw new HttpError(409,`Cannot create a new campaign in ${s.phase}`);
+    if(!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED','PREPARING'].includes(s.phase))throw new HttpError(409,`Cannot create a new campaign in ${s.phase}`);
     if(await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}}}))
       throw new HttpError(409,'Wait for the submitted transaction to confirm before creating a campaign');
-    if(await this.db.transfer.count({where:{kind:'PAYOUT',status:'CONFIRMED'}}))
-      throw new HttpError(409,'This pool has already paid stakes; it cannot be reused for a new campaign');
+    if(await this.db.transfer.count({where:{kind:'PAYOUT',status:'CONFIRMED'}}))throw new HttpError(409,'This pool has already paid stakes');
     const previouslyJoined=await this.joined();
     if(previouslyJoined.length){
       const balances=await this.reconcile();if(!balances)throw new HttpError(409,'Pool verification failed');
@@ -263,20 +361,22 @@ export class EngineService {
       if(balance<TARGET||w.joined&&balance!==w.entryBalanceSun)
         throw new HttpError(409,`Node ${w.ordinal+1} must hold 1 TRX plus its recorded personal reserve`);
     }
-    const startedAt=new Date(Date.now()+2*60_000),totalDays=options.totalDays??36;
-    const deadlineAt=options.deadlineAt??new Date(startedAt.getTime()+(totalDays+6)*DAY);
-    if(!Number.isInteger(totalDays)||totalDays<18||totalDays>60||!Number.isFinite(deadlineAt.getTime()))throw new HttpError(400,'Choose 18–60 campaign days and a valid deadline');
-    const baseSeed=randomBytes(16).toString('hex');
-    let plan:CampaignPlan|undefined;
-    for(let attempt=0;attempt<32;attempt++){
-      const candidate=buildCampaignPlan(selected,`${baseSeed}:${attempt}`,startedAt,totalDays);
-      const rows=candidate.steps.map((step,i)=>({...step,id:String(i),sequence:i+1,status:'PLANNED',campaignDay:step.day}));
-      const shapes=selected.map(w=>shapeSignature(ownershipFlow(w.address,rows)));
-      if(new Set(shapes).size===selected.length){plan=candidate;break;}
+    const startedAt=new Date(Date.now()+2*60_000);
+    const saved=s.selectedPlanVariantId?await this.db.planVariant.findUnique({where:{id:s.selectedPlanVariantId}}):null;
+    if(s.phase==='PREPARING'&&!saved)throw new HttpError(409,'Generate or choose a saved plan before Start');
+    const totalDays=saved?.totalDays??options.totalDays??36;
+    const deadlineAt=saved?.deadlineAt??options.deadlineAt??new Date(startedAt.getTime()+(totalDays+6)*DAY);
+    let plan:CampaignPlan;
+    if(saved){
+      const loaded=loadVariant(saved,startedAt);
+      if(JSON.stringify(loaded.members.map(m=>m.address))!==JSON.stringify(selected.map(m=>m.address)))throw new HttpError(409,'Selected wallets differ from the saved plan; regenerate or select that variant again');
+      plan=loaded.plan;
+    }else{
+      if(!Number.isInteger(totalDays)||totalDays<18||totalDays>60)throw new HttpError(400,'Choose 18–60 campaign days');
+      try{plan=buildBalancedPlan(selected,randomBytes(16).toString('hex'),startedAt,totalDays).plan;}
+      catch(e){throw new HttpError(409,(e as Error).message);}
     }
-    if(!plan)throw new HttpError(409,'Could not generate distinct report structures; retry without sending any transactions');
-    if(Math.max(...plan.steps.map(t=>t.plannedAt.getTime()))>deadlineAt.getTime()-4*DAY)
-      throw new HttpError(400,'The complete plan must leave at least four days before the deadline for payouts and reports');
+    this.checkDeadline(plan,deadlineAt);
     const id=randomUUID(),stepIds=plan.steps.map(()=>randomUUID());
     const chosen=plan;
     await this.db.$transaction(async tx=>{
@@ -287,7 +387,8 @@ export class EngineService {
         await tx.wallet.update({where:{address:w.address},data:{joined:true,entryBalanceSun:balance}});
         await tx.audit.create({data:{event:'JOIN',detail:`${w.address} joined with 1 TRX; ${balance-TARGET} extra Sun reserved`}});
       }
-      await tx.campaign.create({data:{id,seed:chosen.seed,startedAt,deadlineAt,totalDays,mixingDays:chosen.mixingDays}});
+      const variant=saved??await saveVariant(tx,selected,chosen,startedAt,deadlineAt);
+      await tx.campaign.create({data:{id,planVariantId:variant.id,version:variant.generatorVersion,seed:chosen.seed,startedAt,deadlineAt,totalDays,mixingDays:chosen.mixingDays}});
       await tx.campaignMember.createMany({data:selected.map((w,i)=>({campaignId:id,address:w.address,ordinal:w.ordinal,profileJson:JSON.stringify(chosen.profiles[i])}))});
       await tx.ownershipBalance.createMany({data:selected.map(w=>({campaignId:id,ownerAddress:w.address,holderAddress:w.address,amountSun:TARGET}))});
       await tx.transfer.createMany({data:chosen.steps.map((step,i)=>({id:stepIds[i],sequence:s.nextSequence+i,kind:step.kind,
@@ -296,7 +397,7 @@ export class EngineService {
         from:step.from,to:step.to,amountSun:step.amountSun,scheduledAt:step.plannedAt,plannedAt:step.plannedAt,
         campaignId:id,campaignDay:step.day,dependsOnId:step.dependsIndex===null?null:stepIds[step.dependsIndex]}))});
       await tx.allocation.createMany({data:chosen.steps.flatMap((step,i)=>step.allocations.map(a=>({...a,transferId:stepIds[i]})))});
-      await tx.engineState.update({where:{id:1},data:{phase:'CAMPAIGN',activeCampaignId:id,nextSequence:s.nextSequence+chosen.steps.length,
+      await tx.engineState.update({where:{id:1},data:{phase:'CAMPAIGN',activeCampaignId:id,selectedPlanVariantId:variant.id,nextSequence:s.nextSequence+chosen.steps.length,
         mixAmountMode:'SMART',lastPlanAt:null,fatalReason:null,haltedFromPhase:null,
         status:`Campaign planned: ${chosen.steps.length} transfers; ${chosen.mixingDays} equal mixing sends per wallet; manual approval unless Auto is enabled`}});
       await tx.audit.create({data:{event:'CAMPAIGN_PLANNED',detail:`Campaign ${id}; ${selected.length} members; ${chosen.mixingDays} mixing rounds; staggered split profiles; ${chosen.steps.length} native transfers; deadline ${deadlineAt.toISOString()}; old unsent approvals cancelled`}});
@@ -606,7 +707,7 @@ export class EngineService {
   }
   async setMixEnabled(address:string,enabled:boolean){return this.withLock(async()=>{
     const s=await this.state();
-    if(!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED'].includes(s.phase))throw new HttpError(409,`Campaign participants are fixed until restoration; cannot change them in ${s.phase}`);
+    if(!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED','PREPARING'].includes(s.phase))throw new HttpError(409,`Campaign participants are fixed until restoration; cannot change them in ${s.phase}`);
     const wallet=await this.db.wallet.findUnique({where:{address}});
     if(!wallet)throw new HttpError(404,'Wallet not found');
     if(wallet.mixEnabled===enabled)return {ok:true};
@@ -627,7 +728,7 @@ export class EngineService {
         await tx.transfer.updateMany({where:{kind:'MIX',status:{in:['PLANNED','APPROVED','PAUSED']}},data:{status:'CANCELLED',note:'Participant selection changed; plan recalculated'}});
         await tx.engineState.update({where:{id:1},data:{lastPlanAt:null,status:'Selection changed; replanning after any in-flight transfer'}});
       }else{
-        await tx.engineState.update({where:{id:1},data:{status:'Ready. Select at least two funded wallets, then Start.'}});
+        await tx.engineState.update({where:{id:1},data:{selectedPlanVariantId:null,status:'Selection changed. Generate or select a complete plan before Start.'}});
       }
       await tx.audit.create({data:{event:'PARTICIPANT_SELECTION',detail:`Node ${wallet.ordinal+1} ${address}: ${enabled?'enabled':'disabled'} for future mixing${wallet.joined?' (stays in settlement pool)':''}`}});
     });
@@ -656,7 +757,7 @@ export class EngineService {
     return true;
   }
   async approve(id:string){return this.withLock(async()=>{
-    const s=await this.state();if(s.phase==='HALTED'||s.phase==='COMPLETE')throw new HttpError(409,'Engine is halted or complete');
+    const s=await this.state();if(['HALTED','COMPLETE','PREPARING'].includes(s.phase))throw new HttpError(409,'Engine is halted or complete');
     const t=await this.db.transfer.findUnique({where:{id}});
     if(!t||t.status!=='PLANNED')throw new HttpError(409,'Transfer is no longer awaiting approval');
     await this.db.transfer.update({where:{id},data:{status:'APPROVED',approvalSource:'MANUAL'}});
@@ -830,6 +931,24 @@ export class EngineService {
     await this.executeTransfer(next,b);
   }
 
+  private async paceTransfer(next:Transfer){
+    // New complete plans only; keep legacy recovery semantics unchanged.
+    if(!next.campaignId)return false;
+    const previous=await this.db.transfer.findFirst({where:{status:'CONFIRMED'},orderBy:[{confirmedAt:'desc'},{updatedAt:'desc'}]});
+    if(!previous)return false;
+    let delay=next.pacingDelayMs;
+    if(next.pacingAfterId!==previous.id||delay===null){
+      const snapshot=await this.tron.bandwidthSnapshot(next.from);
+      const full=snapshot.limit>0&&snapshot.available>=snapshot.limit;
+      delay=full?randomInt(60_000,120_001):randomInt(300_000,600_001);
+      await this.db.transfer.update({where:{id:next.id},data:{pacingAfterId:previous.id,pacingDelayMs:delay}});
+    }
+    const until=new Date((previous.confirmedAt??previous.updatedAt).getTime()+delay!);
+    if(until.getTime()<=Date.now())return false;
+    await this.delayTransfer(next,until,`Random gap after #${previous.sequence}: ${Math.ceil(delay!/1000)} seconds; resource check still required`);
+    await this.db.engineState.update({where:{id:1},data:{status:`Random interval before #${next.sequence}: ${until.toISOString()}`}});
+    return true;
+  }
   private async executeTransfer(next:Transfer,b:PoolBalance[]){
     if(next.campaignId){
       const [allocations,members]=await Promise.all([
@@ -862,9 +981,12 @@ export class EngineService {
         await this.fatal(`Insufficient game balance for transfer #${next.sequence}; extra Sun is reserved`);return;
       }
       if(next.kind==='PAYOUT'&&sender.sun!==senderWallet.entryBalanceSun){await this.fatal(`Payout wallet ${next.from} holds ${sender.sun}, expected ${senderWallet.entryBalanceSun} including reserved Sun`);return;}
+      if(await this.paceTransfer(next))return;
       await this.db.engineState.update({where:{id:1},data:{status:`Preflight ${next.kind.toLowerCase()} #${next.sequence} from ${next.from}`}});
       let prepared;
-      try{prepared=await this.tron.prepare(next.from,next.to,next.amountSun);}catch(e){
+      try{prepared=await this.tron.prepare(next.from,next.to,next.amountSun,async()=>{
+        if(next.campaignId)await this.db.campaign.updateMany({where:{id:next.campaignId,executionStartedAt:null},data:{executionStartedAt:new Date(Date.now())}});
+      });}catch(e){
         if(e instanceof BandwidthWait){
           await this.delayTransfer(next,e.nextCheckAt,`Bandwidth: ${e.message}`);
           await this.db.engineState.update({where:{id:1},data:{status:`Waiting for bandwidth: ${next.from}; ${e.message}`}});return;
@@ -907,7 +1029,7 @@ export class EngineService {
   }
   private async tickBody(){
     let s=await this.state();
-    if(['IDLE','COMPLETE','HALTED'].includes(s.phase))return;
+    if(['IDLE','PREPARING','COMPLETE','HALTED'].includes(s.phase))return;
     try{
       const active=await this.db.transfer.findFirst({where:{status:{in:['SUBMITTING','SUBMITTED','UNKNOWN']}},orderBy:{sequence:'asc'}});
       let justConfirmed=false;

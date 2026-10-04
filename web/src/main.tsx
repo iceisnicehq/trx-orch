@@ -2,11 +2,13 @@ import React,{useCallback,useEffect,useMemo,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import {Network,groupRoutes,type Graph,type GraphEdge,type GraphMode} from './Network';
 import {CampaignControls,type Campaign} from './CampaignControls';
+import {PlanManager,type Plans} from './PlanManager';
 import {StakeReport} from './StakeReport';
+import {RefreshGate,refreshSections,section,getJson as get} from './refresh';
 import './style.css';
 
 type Wallet={address:string;ordinal:number;autoApprove:boolean;mixEnabled:boolean;joined:boolean;reserveSun:number;balanceSun:number;bandwidth:number};
-type State={mode:string;phase:string;status:string;fatalReason:string|null;teacherAddress:string;expectedPoolSun:number;poolSun:number;reserveSun:number;configuredSun:number;selectedCount:number;joinedCount:number;wallets:Wallet[];updatedAt:string;mixAmountMode:string;activeCampaignId:string|null;mixAmountListSun:number[];mixAmountCursor:number;rebalanceTotal:number;rebalanceDone:number};
+type State={mode:string;phase:string;status:string;fatalReason:string|null;teacherAddress:string;expectedPoolSun:number;poolSun:number;reserveSun:number;configuredSun:number;selectedCount:number;joinedCount:number;wallets:Wallet[];updatedAt:string;mixAmountMode:string;activeCampaignId:string|null;selectedPlanVariantId:string|null;mixAmountListSun:number[];mixAmountCursor:number;rebalanceTotal:number;rebalanceDone:number};
 type RebalancePreview={pendingReceipt:boolean;transferCount:number|null;steps:{from:string;to:string;amountSun:number}[]};
 type ExtraRecoveryPreview={eligible:boolean;reason:string|null;phase:string|null;extras:{address:string;sun:number}[];totalExtraSun:number;haltReason:string|null};
 type Edge=GraphEdge;
@@ -18,7 +20,6 @@ const fmt=(sun:number)=>`${(sun/1_000_000).toFixed(6)} TRX`;
 const short=(s:string)=>s.length>20?`${s.slice(0,7)}…${s.slice(-6)}`:s;
 const when=(v:string)=>new Date(v).toLocaleString();
 const whenMSK=(v:string)=>`${new Date(v).toLocaleString('en-GB',{timeZone:'Europe/Moscow',hour12:false})} MSK`;
-async function get<T>(path:string):Promise<T>{const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw Error(await r.text());return r.json();}
 async function post(path:string,body:object){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error??`HTTP ${r.status}`);return j;}
 
 function TransferChain({items,label,nodeLabel}:{items:GraphEdge[];label:string;nodeLabel:(address:string)=>string}){
@@ -46,16 +47,35 @@ function App(){
   const [historyAddress,setHistoryAddress]=useState<string|null>(null),[historyRows,setHistoryRows]=useState<HistoryTransfer[]>([]);
   const [historyStatus,setHistoryStatus]=useState<HistoryStatus>('CONFIRMED');
   const [historyNext,setHistoryNext]=useState<number|null>(null),[historyTotal,setHistoryTotal]=useState(0),[historyLoading,setHistoryLoading]=useState(false),[historyError,setHistoryError]=useState('');
+  const [plans,setPlans]=useState<Plans|null>(null);
   const refreshId=useRef(0);
+  const refreshGate=useRef(new RefreshGate());
+  const refreshController=useRef<AbortController|null>(null);
   const historyRequestId=useRef(0);
   const priorPhase=useRef<string|null>(null);
-  const refresh=useCallback(async()=>{const id=++refreshId.current;try{
-    const [s,g,q,l,c]=await Promise.all([get<State>('/api/state'),get<Graph>('/api/graph'),get<Edge[]>('/api/queue'),get<{events:Event[];transfers:Edge[]}>(`/api/logs/${encodeURIComponent(node)}?page=${page}&status=${logStatus}`),get<Campaign|null>('/api/campaign')]);
-    if(id!==refreshId.current)return;
-    setState(s);setGraph(g);setQueue(q);setLogs(l);setCampaign(c);
-    setError(previous=>previous.startsWith('Cannot refresh:')?'':previous);
-  }catch(e){if(id===refreshId.current)setError(`Cannot refresh: ${String(e)}`);}},[node,page,logStatus]);
-  useEffect(()=>{void refresh();const id=setInterval(()=>void refresh(),5000);return()=>clearInterval(id);},[refresh]);
+  const refresh=useCallback(()=>refreshGate.current.run(async()=>{
+    const id=++refreshId.current,controller=new AbortController();refreshController.current=controller;
+    const current=()=>id===refreshId.current&&!controller.signal.aborted;
+    const load=<T,>(path:string)=>get<T>(path,controller.signal);
+    try{
+      const failures=await refreshSections([
+        section('State',()=>load<State>('/api/state'),setState),
+        section('Graph',()=>load<Graph>('/api/graph'),setGraph),
+        section('Queue',()=>load<Edge[]>('/api/queue'),setQueue),
+        section('Logs',()=>load<{events:Event[];transfers:Edge[]}>(`/api/logs/${encodeURIComponent(node)}?page=${page}&status=${logStatus}`),setLogs),
+        section('Campaign',()=>load<Campaign|null>('/api/campaign'),setCampaign),
+        section('Plans',()=>load<Plans>('/api/plans'),setPlans)
+      ],current);
+      if(current())setError(previous=>failures.length?`Cannot refresh: ${failures.join('; ')}`:previous.startsWith('Cannot refresh:')?'':previous);
+    }catch(e){if(current())setError(`Cannot refresh: ${String(e)}`);}
+    finally{if(refreshController.current===controller)refreshController.current=null;}
+  }),[node,page,logStatus]);
+  useEffect(()=>{
+    let stopped=false,timer:ReturnType<typeof setTimeout>;
+    const poll=async()=>{await refresh();if(!stopped)timer=setTimeout(()=>void poll(),5000);};
+    void poll();
+    return()=>{stopped=true;clearTimeout(timer);refreshId.current++;refreshController.current?.abort();};
+  },[refresh]);
   useEffect(()=>{if(!state)return;const phase=state.phase;
     if(['END_REQUESTED','SETTLING','REBALANCE_REQUESTED','REBALANCING','CAMPAIGN_RETURN_REQUESTED','CAMPAIGN_RETURNING'].includes(phase)){setGraphMode('settlement');setRouteId(null);}
     else if(phase==='MIXING'&&['REBALANCE_REQUESTED','REBALANCING'].includes(priorPhase.current??'')){setGraphMode('forecast');setRouteId(null);}
@@ -101,7 +121,7 @@ function App(){
   }
   return <div className="app">
     <header className="top"><div className="brand"><span className="brandmark">◈</span><div><b>TRX POOL</b><small>OBSERVATORY / {state?.mode.toUpperCase()??'CONNECTING'}</small></div></div><div className="right"><span className={'pill '+(state?.phase==='HALTED'?'bad':['MIXING','REBALANCING','REBALANCE_REQUESTED','CAMPAIGN','CAMPAIGN_RETURNING'].includes(state?.phase??'')?'running':'')}>{state?.phase??'CONNECTING'}</span><span className="updated">Updated {state?when(state.updatedAt):'—'}</span></div></header>
-    <main><div className={'status '+(state?.phase==='HALTED'?'danger':'')}><span className="pulse"/><strong>{state?.status??'Status: connecting…'}</strong></div>
+    <main><div className={'status '+(state?.phase==='HALTED'?'danger':'')}><span className="pulse"/><strong>{state?.status??(error?'Status: API request failed; retrying…':'Status: connecting…')}</strong></div>
       {error&&<div className="error" role="alert">{error}</div>}
       {state&&['REBALANCE_REQUESTED','REBALANCING'].includes(state.phase)&&<div className="rebalance-progress" role="status">{state.phase==='REBALANCE_REQUESTED'?'Rebalance: waiting for an in-flight transfer to finish.':`Rebalance: ${state.rebalanceDone} of ${state.rebalanceTotal} transfers confirmed.`} Remaining steps appear in the queue and settlement map.</div>}
       <div className="metrics">
@@ -129,12 +149,13 @@ function App(){
               {w.reserveSun>0&&<small>{w.reserveSun} extra Sun {w.joined?'reserved':'outside the 1 TRX stake'}</small>}
             </div>
             <div className="wallet-controls">
-              <button className={'mix-check '+(w.mixEnabled?'on':'')} role="checkbox" aria-checked={w.mixEnabled} aria-label={`Include node ${w.ordinal+1} in mixing`} disabled={!state||!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED'].includes(state.phase)} onClick={()=>ask(`${w.mixEnabled?'Pause mixing for':'Include'} node ${w.ordinal+1}`,`/api/admin/wallets/${w.address}/mix-enabled`,{enabled:!w.mixEnabled})}>{w.mixEnabled?'✓':''}</button>
+              <button className={'mix-check '+(w.mixEnabled?'on':'')} role="checkbox" aria-checked={w.mixEnabled} aria-label={`Include node ${w.ordinal+1} in mixing`} disabled={!state||!['IDLE','MIXING','LEGACY_PAUSED','CAMPAIGN_RESTORED','PREPARING'].includes(state.phase)} onClick={()=>ask(`${w.mixEnabled?'Pause mixing for':'Include'} node ${w.ordinal+1}`,`/api/admin/wallets/${w.address}/mix-enabled`,{enabled:!w.mixEnabled})}>{w.mixEnabled?'✓':''}</button>
               <button className={'toggle '+(w.autoApprove?'on':'')} role="switch" aria-checked={w.autoApprove} aria-label={`Autoapprove node ${w.ordinal+1}`} onClick={()=>ask(`${w.autoApprove?'Disable':'Enable'} autoapproval for node ${w.ordinal+1}`,`/api/admin/wallets/${w.address}/autoapprove`,{enabled:!w.autoApprove})}><span/></button>
             </div>
           </div>)}</div>
         </aside></div>
-      <div className="bottom-grid"><section className="panel"><div className="section-head"><div><span className="eyebrow">REVIEW DESK</span><h2>Transaction queue</h2></div><span className="count">{queue.length} nearest</span></div><p className="history-intro">Ближайшая незавершённая отправка каждого участника. Полное будущее движение ставки доступно по клику на Node → «Мой 1 TRX».</p><div className="table-wrap"><table><thead><tr><th>SEQ / TYPE</th><th>ROUTE</th><th>AMOUNT</th><th>SCHEDULE</th><th>STATE</th><th></th></tr></thead><tbody>{queue.length?queue.map(q=><tr key={q.id}><td><b>#{q.sequence}</b><small>{q.kind}{q.campaignDay?` · day ${q.campaignDay}`:''}</small></td><td className="route" title={`${q.from} → ${q.to}`}>{short(q.from)} → {short(q.to)}</td><td>{fmt(q.amountSun)}</td><td title={when(q.scheduledAt)}>{new Date(q.scheduledAt).getTime()<=Date.now()?'Due now':when(q.scheduledAt)}</td><td><span className={'tag '+q.status.toLowerCase()}>{q.status}</span>{q.note&&<small className="queue-note" title={q.note}>{q.note}</small>}</td><td>{q.status==='PLANNED'&&<button className="mini" onClick={()=>ask(`Approve #${q.sequence} · ${fmt(q.amountSun)}`,`/api/admin/queue/${q.id}/approve`)}>Approve</button>}</td></tr>):<tr><td colSpan={6} className="empty">No transfers awaiting execution.</td></tr>}</tbody></table></div></section>
+      <PlanManager plans={plans} campaign={campaign} phase={state?.phase??'CONNECTING'} selectedCount={state?.selectedCount??0} ask={ask} revision={state?.updatedAt??''}/>
+      <div className="bottom-grid"><section className="panel"><div className="section-head"><div><span className="eyebrow">REVIEW DESK</span><h2>Transaction queue</h2></div><span className="count">{queue.length} nearest</span></div><p className="history-intro">Ближайшая незавершённая отправка каждого участника. DRAFT — только предпросмотр: сначала Start, затем одобрение. Полное будущее движение ставки доступно по клику на Node → «Мой 1 TRX».</p><div className="table-wrap"><table><thead><tr><th>SEQ / TYPE</th><th>ROUTE</th><th>AMOUNT</th><th>SCHEDULE</th><th>STATE</th><th></th></tr></thead><tbody>{queue.length?queue.map(q=><tr key={q.id}><td><b>#{q.sequence}</b><small>{q.kind}{q.campaignDay?` · day ${q.campaignDay}`:''}</small></td><td className="route" title={`${q.from} → ${q.to}`}>{short(q.from)} → {short(q.to)}</td><td>{fmt(q.amountSun)}</td><td title={when(q.scheduledAt)}>{q.status==='DRAFT'?'После Start · day '+q.campaignDay:new Date(q.scheduledAt).getTime()<=Date.now()?'Due now':when(q.scheduledAt)}</td><td><span className={'tag '+q.status.toLowerCase()}>{q.status}</span>{q.note&&<small className="queue-note" title={q.note}>{q.note}</small>}</td><td>{q.status==='PLANNED'&&<button className="mini" onClick={()=>ask(`Approve #${q.sequence} · ${fmt(q.amountSun)}`,`/api/admin/queue/${q.id}/approve`)}>Approve</button>}</td></tr>):<tr><td colSpan={6} className="empty">No transfers awaiting execution.</td></tr>}</tbody></table></div></section>
       <section className="panel"><div className="section-head"><div><span className="eyebrow">PUBLIC AUDIT</span><h2>Node history</h2></div><select aria-label="Filter logs by node" value={node} onChange={e=>choose(e.target.value)}><option value="all">All nodes</option>{state?.wallets.map(w=><option key={w.address} value={w.address}>Node {w.ordinal+1}</option>)}{state&&<option value={state.teacherAddress}>Teacher</option>}</select></div><div className="history-filters" role="group" aria-label="Filter public transfer log">{(['CONFIRMED','ALL'] as const).map(status=><button key={status} type="button" aria-pressed={logStatus===status} className={logStatus===status?'active':''} onClick={()=>{setLogStatus(status);setPage(0);setLogs(previous=>({...previous,transfers:[]}));}}>{status==='CONFIRMED'?'Confirmed':'All'}</button>)}</div><div className="loglist">{logs.transfers.length?logs.transfers.map(t=><div className="log" key={t.id}><span className={'dot '+(t.status==='CONFIRMED'?'done':'')}/><div><b>{t.kind} · {fmt(t.amountSun)}</b><small>{short(t.from)} → {short(t.to)} · {t.status}</small>{t.status==='CONFIRMED'&&<small>{t.bandwidthUsed===null||t.bandwidthUsed===undefined?'Bandwidth unavailable from receipt':`${t.bandwidthUsed} Bandwidth used`} · 0 Sun fee</small>}{t.txId&&<small title={t.txId}>TX {short(t.txId)}</small>}</div><time>{when(t.confirmedAt??t.updatedAt??t.scheduledAt)}</time></div>):<p className="empty">{logStatus==='CONFIRMED'?'No confirmed transfers in this view.':'No transfers recorded.'}</p>}{logs.events.length>0&&<><h3 className="audit-title">System events</h3>{logs.events.map(e=><div className="event" key={e.id}><b>{e.event}</b><span>{e.detail}</span><time>{when(e.at)}</time></div>)}</>}</div><div className="pager"><button disabled={page===0} onClick={()=>setPage(page-1)}>Previous</button><span>Page {page+1}</span><button disabled={logs.transfers.length<100&&logs.events.length<100} onClick={()=>setPage(page+1)}>Next</button></div></section></div>
       <footer>Pool conservation is verified against the chain before each transfer. Broadcasting pauses when free bandwidth or receipt certainty is insufficient.</footer>
     </main>

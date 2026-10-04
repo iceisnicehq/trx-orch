@@ -137,23 +137,31 @@ export class TelegramService {
   private async ingestAudits(){
     const {channelId}=this.options!;
     const {wallets,teacherAddress}=await this.names();
+    const before=await this.db.telegramCursor.findUniqueOrThrow({where:{channelId}});
+    const events=await this.db.audit.findMany({where:{id:{gt:before.lastAuditId}},orderBy:{id:'asc'},take:100});
+    if(!events.length)return;
+    const ids=events.flatMap(e=>e.transferId?[e.transferId]:[]);
+    const transfers=await this.db.transfer.findMany({where:{id:{in:ids}}});
+    const byId=new Map(transfers.map(t=>[t.id,t]));
+    // Render outside the writer transaction and insert in one batch. Only
+    // deliveries + cursor advancement require the same atomic commit.
+    const deliveries=events.map(event=>({channelId,auditId:event.id,
+      text:renderAudit(event,event.transferId?byId.get(event.transferId)??null:null,wallets,teacherAddress),
+      priority:event.event==='FATAL'?10:0}));
     await this.db.$transaction(async tx=>{
       const cursor=await tx.telegramCursor.findUniqueOrThrow({where:{channelId}});
-      const events=await tx.audit.findMany({where:{id:{gt:cursor.lastAuditId}},orderBy:{id:'asc'},take:100});
-      for(const event of events){
-        const transfer=event.transferId?await tx.transfer.findUnique({where:{id:event.transferId}}):null;
-        await tx.telegramDelivery.create({data:{channelId,auditId:event.id,text:renderAudit(event,transfer,wallets,teacherAddress),
-          priority:event.event==='FATAL'?10:0}});
-      }
-      if(events.length)await tx.telegramCursor.update({where:{channelId},data:{lastAuditId:events.at(-1)!.id}});
-    },{timeout:30_000});
+      if(cursor.lastAuditId!==before.lastAuditId)return; // retry a newer cursor on the next pass
+      await tx.telegramDelivery.createMany({data:deliveries});
+      await tx.telegramCursor.update({where:{channelId},data:{lastAuditId:events.at(-1)!.id}});
+    });
   }
+
   private async editQueue(){
     const {channelId,pinnedMessageId,dashboardUrl}=this.options!;
     const [cursor,state,rows,{wallets,teacherAddress}]=await Promise.all([
       this.db.telegramCursor.findUniqueOrThrow({where:{channelId}}),
       this.db.engineState.findUniqueOrThrow({where:{id:1}}),
-      this.db.transfer.findMany({where:{status:{in:OPEN_STATUSES}},orderBy:{sequence:'asc'}}),
+      this.db.transfer.findMany({where:{status:{in:OPEN_STATUSES}},orderBy:{sequence:'asc'},select:{sequence:true,kind:true,from:true,to:true,amountSun:true,scheduledAt:true,status:true,campaignId:true}}),
       this.names()
     ]);
     const rendered=renderQueue(state.phase,approvalQueue(rows),wallets,teacherAddress,dashboardUrl);
